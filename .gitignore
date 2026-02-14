@@ -8,3 +8,15 @@ _root_work/*.err.log
 _root_work/*.img
 
 boot-stock.img
+
+# Toolbox runtime files (keep adb.exe tracked by default)
+搞机工具箱v11.exe
+MaterialSkin.dll
+Connector.cmd
+连接教程.bat
+AdbWinApi.dll
+AdbWinUsbApi.dll
+ApkExt/
+Log/
+Screenshots/
+Script/
