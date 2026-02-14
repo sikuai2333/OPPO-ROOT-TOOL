@@ -20,3 +20,6 @@ ApkExt/
 Log/
 Screenshots/
 Script/
+
+tools/bin/
+tools/.cache/

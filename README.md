@@ -5,52 +5,77 @@
 - 目标设备: `OPPO Reno5 Pro+ (PDRM00 / OP4EA7)`
 - 目标系统: `ColorOS 13.1.0.201(CN01)`
 
-## 1. 仓库用途
+## 1. OTA 包来源（重点）
 
-本仓库用于沉淀一次可复现的 Root 过程，重点记录:
+本仓库使用的 OTA 包不是论坛镜像，而是通过 Oplus 官方 OTA 查询接口拿到的官方 CDN 链接。
 
-- 版本一致性校验方法
-- OTA 包提取 `boot.img` 的步骤
-- Magisk 修补与 fastboot 刷写流程
-- Root 成功验证与回滚路径
+- 查询接口主机（CN）: `component-ota-cn.allawntech.com`（接口路径 `/update/v5`）
+- 包下载域名（返回结果中的 CDN）:
+  - `gauss-compotacostauto-cn.allawnfs.com`
+  - `gauss-componentotacostmanual-cn.allawnfs.com`
 
-适合后续自己复用，也方便直接上传到 GitHub 做留档。
+本次实操查询参数与结果（示例）:
 
-## 2. 目录说明
+```powershell
+updater PDRM00_11.F.24_2240_202506291009 --region CN --model PDRM00 --carrier 10011000 --json
+```
 
-- `README.md`: 总览与入口
-- `docs/OTA-DOWNLOAD.md`: OTA 下载工具与命令说明
-- `docs/ROOT-WORKFLOW.md`: 完整操作流程
-- `docs/TROUBLESHOOTING.md`: 常见问题排查
-- `docs/ROLLBACK.md`: 回滚到原厂 boot 的步骤
-- `docs/SESSION-2026-02-14.md`: 本次实操记录
-- `_root_work/`: 本地工作区（含脚本与本地保留镜像）
+返回中确认:
 
-## 3. 快速开始
+- `versionName = PDRM00_13.1.0.201(CN01)`
+- `otaVersion = PDRM00_11.F.26_2260_202512111236`
+- `md5 = bd073f00045571696359e470366b9351`
+- `package_url`（示例）:
+  - `https://gauss-compotacostauto-cn.allawnfs.com/remove-ca6670f0baba3d136956b38dc7186104/component-ota/25/12/15/99ee88345ecb43b1bfd8ab282d714d91.zip`
 
-1. 先读 `docs/ROOT-WORKFLOW.md`，按“版本一致性检查”确认目标包是否匹配。
-2. 下载 OTA 前先读 `docs/OTA-DOWNLOAD.md`，确认下载工具与校验方式。
-2. 修补前，必须确认当前系统版本与 `boot.img` 来源版本完全一致。
-3. 修补后只刷正确分区:
-   - 本机是非 A/B 机型 -> 刷 `boot`
-4. 刷写后用 `su -c id` 验证是否获取 root。
+结论: 该 OTA 包与目标系统版本一致，可用于提取 `boot.img` 修补。
 
-## 4. 本次结论
+## 2. 仅凭本仓库继续 Root（工具代码已内置）
 
-- 本机已成功 Root。
-- 当前验证结果:
-  - `su -v` -> `30.6:MAGISKSU`
-  - `su -c id` -> `uid=0(root)`
+仓库已内置工具代码，无需再手抄命令逻辑:
 
-## 5. 提交到 GitHub 建议
+- OTA 查询脚本: `tools/query_ota.ps1`
+- OTA 多线程下载脚本: `tools/download_ota_multithread.py`
 
-如果你只想同步文档，不要把大文件一起推送:
+最小依赖:
 
-- 已通过 `.gitignore` 忽略 `_root_work/*.img`、OTA 包和分片文件。
-- 推送前建议再执行一次:
+- `adb` / `fastboot`
+- Python 3（运行下载脚本）
+- Git（用于拉取查询器源码）
+- Go（用于构建仓库内查询器）
+
+说明:
+
+- `tools/query_ota.ps1` 会自动在 `tools/bin/updater.exe` 构建兼容版查询器，避免系统内旧版 `updater` 参数不兼容问题。
+
+## 3. 快速流程
+
+1. 查询 OTA 链接:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File tools/query_ota.ps1 -OtaVersion PDRM00_11.F.24_2240_202506291009 -Model PDRM00 -Carrier 10011000 -Region CN
+   ```
+2. 使用返回的 `package_url` 下载并校验:
+   ```powershell
+   python tools/download_ota_multithread.py --url "<package_url>" --out "_root_work/PDRM00_ota.zip" --threads 16 --md5 "<package_md5>"
+   ```
+3. 从 OTA 提取 `boot.img`，推送手机修补，刷回 `boot` 分区。
+4. `adb shell "su -c id"` 验证 root。
+
+详细步骤看:
+
+- `docs/ROOT-WORKFLOW.md`
+- `docs/OTA-DOWNLOAD.md`
+- `docs/TROUBLESHOOTING.md`
+- `docs/ROLLBACK.md`
+- `docs/SESSION-2026-02-14.md`
+
+## 4. GitHub 提交建议
+
+- `.gitignore` 已忽略 OTA 大包、分片、镜像等临时文件。
+- 推送前先看:
 
 ```powershell
 git status
 ```
 
-确认只包含文档文件后再推送远端。
+确认没有大文件误提交后再 push。
