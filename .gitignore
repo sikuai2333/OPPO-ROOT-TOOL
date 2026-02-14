@@ -1,0 +1,10 @@
+_tmp_repos/
+
+_root_work/
+_root_work/*.zip
+_root_work/*.part*
+_root_work/*.log
+_root_work/*.err.log
+_root_work/*.img
+
+boot-stock.img
