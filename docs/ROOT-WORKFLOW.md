@@ -10,6 +10,8 @@
 - PC 已有 `adb` 和 `fastboot`
 - Magisk App 已安装
 
+下载 OTA 的工具与命令说明见: `docs/OTA-DOWNLOAD.md`
+
 ## 2. 基础连通性检查
 
 ```powershell
@@ -103,4 +105,3 @@ adb shell "su -c id"
 
 - `su -v` 返回 `MAGISKSU`
 - `su -c id` 返回 `uid=0(root)`
-

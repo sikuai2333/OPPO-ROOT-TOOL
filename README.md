@@ -19,6 +19,7 @@
 ## 2. 目录说明
 
 - `README.md`: 总览与入口
+- `docs/OTA-DOWNLOAD.md`: OTA 下载工具与命令说明
 - `docs/ROOT-WORKFLOW.md`: 完整操作流程
 - `docs/TROUBLESHOOTING.md`: 常见问题排查
 - `docs/ROLLBACK.md`: 回滚到原厂 boot 的步骤
@@ -28,6 +29,7 @@
 ## 3. 快速开始
 
 1. 先读 `docs/ROOT-WORKFLOW.md`，按“版本一致性检查”确认目标包是否匹配。
+2. 下载 OTA 前先读 `docs/OTA-DOWNLOAD.md`，确认下载工具与校验方式。
 2. 修补前，必须确认当前系统版本与 `boot.img` 来源版本完全一致。
 3. 修补后只刷正确分区:
    - 本机是非 A/B 机型 -> 刷 `boot`
@@ -52,4 +54,3 @@ git status
 ```
 
 确认只包含文档文件后再推送远端。
-
