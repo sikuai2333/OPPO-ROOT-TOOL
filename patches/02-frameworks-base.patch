@@ -472,9 +472,18 @@ index c82376c15..0dee2a0f3 100644
          || maxCodeItemBytes > 4L * 1024 * 1024
          || maxCodeItemBytes > bufferPoolBytes
 diff --git a/services/core/java/com/android/server/am/ActivityManagerService.java b/services/core/java/com/android/server/am/ActivityManagerService.java
-index 31637bf4f..77973f3eb 100644
+index 31637bf4f..090f30afb 100644
 --- a/services/core/java/com/android/server/am/ActivityManagerService.java
 +++ b/services/core/java/com/android/server/am/ActivityManagerService.java
+@@ -2014,7 +2014,7 @@ public class ActivityManagerService extends IActivityManager.Stub
+                 updateLruProcessLocked(app, false, null);
+                 updateOomAdjLocked(OOM_ADJ_REASON_SYSTEM_INIT);
+             }
+-        } catch (PackageManager.NameNotFoundException e) {
++        } catch (NameNotFoundException e) {
+             throw new RuntimeException(
+                     "Unable to find android system package", e);
+         }
 @@ -19340,26 +19340,46 @@ public class ActivityManagerService extends IActivityManager.Stub
          final int callingPid = Binder.getCallingPid();
          if (packageName == null || processName == null || runId == null
@@ -528,8 +537,75 @@ index 31637bf4f..77973f3eb 100644
              return null;
          }
          try {
+@@ -19405,14 +19425,65 @@ public class ActivityManagerService extends IActivityManager.Stub
+         if (splitCount != 0) {
+             System.arraycopy(target.splitSourceDirs, 0, apkPaths, 1, splitCount);
+         }
++        final PackageInfo packageInfo = mPackageManagerInt.getPackageInfo(
++                packageName,
++                (long) PackageManager.GET_ACTIVITIES | PackageManager.GET_META_DATA,
++                callingUid,
++                UserHandle.USER_SYSTEM);
++        if (packageInfo == null) {
++            Slog.w(TAG, "r0dump export: no package info for " + packageName);
++            return null;
++        }
++        final String versionName =
++                packageInfo.versionName == null ? "" : packageInfo.versionName;
++        final CharSequence labelSequence = target.loadLabel(mContext.getPackageManager());
++        final String label = labelSequence == null ? "" : labelSequence.toString();
++        final String launcher =
++                resolveR0dumpLauncherActivity(packageName, target.uid);
++        Slog.d(TAG, "r0dump export identity pkg=" + packageName
++                + " version=" + versionName + " label=" + label
++                + " launcher=" + launcher);
+         try {
+-            return mR0dumpFilePreparationBridge.exportLatest(callingUid, packageName, apkPaths);
++            return mR0dumpFilePreparationBridge.exportLatest(
++                    callingUid, packageName, apkPaths, versionName, label, launcher);
+         } catch (IOException e) {
+             Slog.w(TAG, "Unable to request r0dump artifact export", e);
+             return null;
+         }
+     }
+ 
++    /**
++     * The launcher activity is what an analyst opens first, so name it in the
++     * export instead of making them decode AndroidManifest.xml by hand.
++     */
++    /**
++     * Entry component an analyst should open first. Resolved through the internal
++     * API so the result is filtered as the target app rather than as system_server
++     * (which cannot see user-installed launcher activities otherwise).
++     */
++    private String resolveR0dumpLauncherActivity(String packageName, int targetUid) {
++        final Intent intent = new Intent(Intent.ACTION_MAIN);
++        intent.addCategory(Intent.CATEGORY_LAUNCHER);
++        intent.setPackage(packageName);
++        final List<ResolveInfo> matches =
++                mPackageManagerInt.queryIntentActivities(
++                        intent,
++                        intent.resolveTypeIfNeeded(mContext.getContentResolver()),
++                        0L,
++                        targetUid,
++                        UserHandle.USER_SYSTEM);
++        if (matches == null) {
++            return "";
++        }
++        for (ResolveInfo match : matches) {
++            if (match.activityInfo != null
++                    && packageName.equals(match.activityInfo.packageName)) {
++                return match.activityInfo.name;
++            }
++        }
++        return "";
++    }
++
+     @Override
+     public ParcelFileDescriptor getLifeMonitor() {
+         if (!isCallerShell()) {
 diff --git a/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java b/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java
-index cc9cbbe58..c91d6c58c 100644
+index cc9cbbe58..c64431237 100644
 --- a/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java
 +++ b/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java
 @@ -20,6 +20,7 @@ import android.system.Os;
@@ -540,15 +616,18 @@ index cc9cbbe58..c91d6c58c 100644
  import java.io.InputStream;
  import java.nio.ByteBuffer;
  import java.nio.ByteOrder;
-@@ -36,10 +37,15 @@ final class r0dump_FilePreparationBridge {
+@@ -36,10 +37,17 @@ final class r0dump_FilePreparationBridge {
    private static final int RESPONSE_BYTES = 12;
    private static final int STATUS_OK = 0;
    private static final int TIMEOUT_MS = 2000;
 +  private static final int SOCKET_BUFFER_BYTES = 64 * 1024;
    private static final int EXPORT_MAGIC = 0x52304558;
    private static final short EXPORT_VERSION = 1;
-   private static final int EXPORT_REQUEST_BYTES = 116;
+-  private static final int EXPORT_REQUEST_BYTES = 116;
 -  private static final int EXPORT_TIMEOUT_MS = 5 * 60 * 1000;
++  private static final int LABEL_BYTES = 128;
++  private static final int COMPONENT_BYTES = 256;
++  private static final int EXPORT_REQUEST_BYTES = 628;
 +  // The receiver blocks on this socket for the whole repair-and-archive pass.
 +  // A packed target legitimately runs past 30 minutes, and the helper now
 +  // streams a progress frame every few hundred files, so a real stall still
@@ -557,7 +636,7 @@ index cc9cbbe58..c91d6c58c 100644
    private static final int MAX_APK_COUNT = 32;
  
    ParcelFileDescriptor prepare(
-@@ -57,6 +63,14 @@ final class r0dump_FilePreparationBridge {
+@@ -57,6 +65,14 @@ final class r0dump_FilePreparationBridge {
            new LocalSocketAddress("r0dump_file_helper", LocalSocketAddress.Namespace.RESERVED));
        // LocalSocket creates its native fd lazily. Socket options are only valid after connect().
        socket.setSoTimeout(TIMEOUT_MS);
@@ -572,3 +651,70 @@ index cc9cbbe58..c91d6c58c 100644
        socket.getOutputStream().write(request);
        socket.getOutputStream().flush();
  
+@@ -80,12 +96,20 @@ final class r0dump_FilePreparationBridge {
+     }
+   }
+ 
+-  ParcelFileDescriptor exportLatest(int requesterUid, String packageName, String[] apkPaths)
++  ParcelFileDescriptor exportLatest(
++      int requesterUid,
++      String packageName,
++      String[] apkPaths,
++      String versionName,
++      String label,
++      String launcherActivity)
+       throws IOException {
+     if (apkPaths == null || apkPaths.length == 0 || apkPaths.length > MAX_APK_COUNT) {
+       throw new IOException("invalid APK path count");
+     }
+-    final byte[] request = encodeExportRequest(requesterUid, packageName, apkPaths.length);
++    final byte[] request =
++        encodeExportRequest(
++            requesterUid, packageName, apkPaths.length, versionName, label, launcherActivity);
+     final ParcelFileDescriptor[] apkDescriptors = new ParcelFileDescriptor[apkPaths.length];
+     try {
+       final FileDescriptor[] descriptors = new FileDescriptor[apkPaths.length];
+@@ -157,7 +181,13 @@ final class r0dump_FilePreparationBridge {
+     return buffer.array();
+   }
+ 
+-  static byte[] encodeExportRequest(int requesterUid, String packageName, int apkCount)
++  static byte[] encodeExportRequest(
++      int requesterUid,
++      String packageName,
++      int apkCount,
++      String versionName,
++      String label,
++      String launcherActivity)
+       throws IOException {
+     if (requesterUid <= 0 || apkCount <= 0 || apkCount > MAX_APK_COUNT) {
+       throw new IOException("invalid export identity");
+@@ -171,9 +201,28 @@ final class r0dump_FilePreparationBridge {
+     buffer.putInt(requesterUid);
+     buffer.putInt(apkCount);
+     putFixedString(buffer, packageName, PACKAGE_BYTES);
++    // The helper cannot read package metadata; carry it so the export can name
++    // the version, the app label and the launcher activity.
++    putOptionalString(buffer, versionName, LABEL_BYTES);
++    putOptionalString(buffer, label, LABEL_BYTES);
++    putOptionalString(buffer, launcherActivity, COMPONENT_BYTES);
+     return buffer.array();
+   }
+ 
++  /** Zero-fills the whole field, so a blank value reads back as empty. */
++  private static void putOptionalString(ByteBuffer buffer, String value, int capacity)
++      throws IOException {
++    final int start = buffer.position();
++    if (value != null) {
++      final byte[] encoded = value.getBytes(StandardCharsets.UTF_8);
++      if (encoded.length >= capacity) {
++        throw new IOException("request field too long");
++      }
++      buffer.put(encoded);
++    }
++    buffer.position(start + capacity);
++  }
++
+   private static void putFixedString(ByteBuffer buffer, String value, int capacity)
+       throws IOException {
+     if (value == null) {

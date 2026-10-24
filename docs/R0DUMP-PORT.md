@@ -162,6 +162,46 @@ total:    30990        # 原 316,609，减少 90%
 
 导出四阶段进度写在 `/storage/emulated/0/Downloads/r0dump-export-progress.json`。
 
+## 8.5 产物组织：让导出包能直接用
+
+第一版导出只把捕获块原样搬进 ZIP，对整壳样本（如农业银行 `com.android.bankabc`）产出的是一堆 `process-*/artifacts/000002.dex.raw`：文件名带 `.raw`、嵌在四层目录里，报告还显示 `usable_outputs: 0`，看上去像「什么都没抓到」。实际那 14 个 DEX 全部有效（magic `dex\n`、声明大小与实际一致、adler32 通过），JADX 能解出 3.9 万个 Java 文件。
+
+四个问题一起修：
+
+| 问题 | 根因 | 修法 |
+|---|---|---|
+| 没有可直接用的 DEX | 产物按「记录→块」组织，整壳直捕没有逐方法记录 | 新增 `dex/` 目录，把通过头部校验的完整 DEX 以 `01-000002.dex` 输出 |
+| `record_count: 0` | ART 写 `process/records/records.jsonl`，导出复制时拍平成 `process/records.jsonl`，加载器仍找原路径 | 复制不再拍平；加载器兼容旧的拍平格式 |
+| `usable_outputs: 0` | 只统计 codeitem 回填，整壳样本天然为 0 | 同上的 dex/ 输出与 index 一起给出真实数量 |
+| 没有入口 Activity | 从来没提取过 | AMS 用 `PackageManagerInternal.queryIntentActivities(MAIN+LAUNCHER, filterCallingUid=targetUid)` 解析，经导出请求带给 helper |
+
+现在每个 run 旁边会多两个文件：
+
+```text
+<run-id>.README.md       版本、入口 Activity、DEX 清单、jadx 命令
+<run-id>.dex-index.json  同一份信息的机器可读版
+```
+
+实测（农业银行 11.3.0）：
+
+```text
+- 版本: 11.3.0
+- 入口 Activity: com.android.bankabc.LauncherActivity
+- DEX 数量: 14
+```
+
+```text
+$ sha256sum -c <run>.zip.sha256   →  OK
+$ unzip -l <run>.zip | wc           →  69 files（含 14 个 dex/）
+$ jadx -d out dex/                  →  29,072 个类，39,098 个 Java 文件
+```
+
+### 三个连环坑
+
+1. **请求缓冲区按最大结构体开。** 接收路径原本用 `sizeof(Request)`（285 字节）做缓冲区，而导出请求扩到 628 字节后，尾部字段被截断——`version`/`label` 恰好落在 285 内所以正常，`launcher` 在偏移 372，永远读回空。改成取两者最大值。
+2. **可选字段不能用严格读取器。** `ReadFixedString` 遇到空字段返回 false，会让整个导出失败；新增宽容的 `OptionalField`。
+3. **`MATCH_DEFAULT_ONLY` 会漏掉 launcher。** launcher 的 intent-filter 只有 `CATEGORY_LAUNCHER` 没有 `CATEGORY_DEFAULT`，而且 `system_server` 调用 `queryIntentActivities` 时默认按自身的可见性过滤，看不到用户应用。改用内部 API 并显式传 `filterCallingUid = targetUid`。
+
 ## 9. 进度条：从假的 10% 到可观测
 
 第一版只在进入复制阶段时写一次 `{"stage":"copying","percent":10}`。打包目标的复制要走过近十万个文件、跑上几十分钟，这个值全程不变——观感和卡死完全一样。

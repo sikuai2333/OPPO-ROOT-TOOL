@@ -1,5 +1,5 @@
 diff --git a/helper/r0dump_export_core.cpp b/helper/r0dump_export_core.cpp
-index 9d6696d..1ecb183 100644
+index 9d6696d..b1002d8 100644
 --- a/helper/r0dump_export_core.cpp
 +++ b/helper/r0dump_export_core.cpp
 @@ -1,5 +1,9 @@
@@ -31,7 +31,7 @@ index 9d6696d..1ecb183 100644
  constexpr uint32_t kMaxMapItems = 4096u;
  constexpr mode_t kDirectoryMode = 02770;
  constexpr mode_t kFileMode = 0660;
-@@ -1956,6 +1965,50 @@ std::vector<fs::path> SortedJsonRecords(const fs::path &records) {
+@@ -1956,6 +1965,56 @@ std::vector<fs::path> SortedJsonRecords(const fs::path &records) {
    return paths;
  }
  
@@ -45,10 +45,16 @@ index 9d6696d..1ecb183 100644
 +
 +std::vector<r0dump_LoadedRecord> r0dump_LoadRecordsJsonl(const fs::path &process) {
 +  std::vector<r0dump_LoadedRecord> out;
-+  const fs::path jsonl = process / "records" / "records.jsonl";
++  // Exports made before the layout fix flattened records.jsonl into the
++  // process directory; keep reading those so old runs stay repairable.
++  fs::path jsonl = process / "records" / "records.jsonl";
 +  std::ifstream input(jsonl, std::ios::binary);
 +  if (!input) {
-+    return out;
++    jsonl = process / "records.jsonl";
++    input.open(jsonl, std::ios::binary);
++    if (!input) {
++      return out;
++    }
 +  }
 +  Json::CharReaderBuilder builder;
 +  std::string line;
@@ -82,7 +88,7 @@ index 9d6696d..1ecb183 100644
  struct Discovered {
    std::string name;
    Json::Value record;
-@@ -1993,14 +2046,26 @@ ProcessSummary RepairProcess(const fs::path &process, const fs::path &output) {
+@@ -1993,14 +2052,26 @@ ProcessSummary RepairProcess(const fs::path &process, const fs::path &output) {
  
    std::vector<Discovered> discovered;
    std::map<std::string, std::set<std::string>> method_hashes;
@@ -115,7 +121,7 @@ index 9d6696d..1ecb183 100644
      entry.artifact = ArtifactPath(process, entry.record);
      if (entry.artifact.has_value()) {
        std::vector<uint8_t> data;
-@@ -2564,8 +2629,163 @@ std::optional<RunCandidate> FindConfiguredRun(const fs::path &runs) {
+@@ -2564,8 +2635,163 @@ std::optional<RunCandidate> FindConfiguredRun(const fs::path &runs) {
  #endif
  }
  
@@ -280,7 +286,7 @@ index 9d6696d..1ecb183 100644
    std::error_code error;
    fs::create_directories(destination, error);
    if (error) {
-@@ -2573,14 +2793,31 @@ bool CopyTree(const fs::path &source, const fs::path &destination,
+@@ -2573,14 +2799,31 @@ bool CopyTree(const fs::path &source, const fs::path &destination,
      return false;
    }
    chmod(destination.c_str(), kDirectoryMode);
@@ -314,16 +320,21 @@ index 9d6696d..1ecb183 100644
      const fs::file_status status = entry.symlink_status(error);
      if (error || fs::is_symlink(status)) {
        *detail = "source_symlink_rejected";
-@@ -2593,6 +2830,26 @@ bool CopyTree(const fs::path &source, const fs::path &destination,
+@@ -2593,6 +2836,31 @@ bool CopyTree(const fs::path &source, const fs::path &destination,
      }
      const fs::path target = destination / relative;
      if (fs::is_directory(status)) {
 +      if (entry.path().filename() == "records") {
-+        // Runs captured after the jsonl switch already hold a single file;
-+        // older runs still hold one file per record and get folded here.
++        // Newer runs already hold a single records.jsonl; older runs still hold
++        // one file per record and get folded. Either way the result stays inside
++        // the records/ directory, because the repair pass looks for it there.
 +        const fs::path jsonl = entry.path() / "records.jsonl";
-+        const fs::path packed = destination / relative.parent_path() / "records.jsonl";
++        const fs::path records_target = destination / relative;
 +        std::error_code exists_error;
++        fs::create_directories(records_target, exists_error);
++        exists_error.clear();
++        chmod(records_target.c_str(), kDirectoryMode);
++        const fs::path packed = records_target / "records.jsonl";
 +        if (fs::is_regular_file(jsonl, exists_error)) {
 +          if (!r0dump_CopyStream(jsonl, packed, kFileMode)) {
 +            *detail = "copy_records_failed";
@@ -341,7 +352,7 @@ index 9d6696d..1ecb183 100644
        fs::create_directory(target, error);
        if (error && error != std::errc::file_exists) {
          *detail = "create_staging_directory_failed";
-@@ -2614,14 +2871,16 @@ bool CopyTree(const fs::path &source, const fs::path &destination,
+@@ -2614,14 +2882,16 @@ bool CopyTree(const fs::path &source, const fs::path &destination,
        return false;
      }
      total_bytes += size;
@@ -361,7 +372,7 @@ index 9d6696d..1ecb183 100644
    return true;
  }
  
-@@ -2710,8 +2969,17 @@ bool AddFileToZip(ZipWriter *writer, const fs::path &file,
+@@ -2710,8 +2980,17 @@ bool AddFileToZip(ZipWriter *writer, const fs::path &file,
    return (input.eof() || input.good()) && writer->FinishEntry() == 0;
  }
  
@@ -381,7 +392,7 @@ index 9d6696d..1ecb183 100644
    FILE *file = fopen(archive.c_str(), "wb");
    if (file == nullptr) {
      return false;
-@@ -2719,19 +2987,15 @@ bool CreateZip(const fs::path &source, const fs::path &archive,
+@@ -2719,19 +2998,15 @@ bool CreateZip(const fs::path &source, const fs::path &archive,
    ZipWriter writer(file);
    bool ok = true;
    std::error_code error;
@@ -410,7 +421,7 @@ index 9d6696d..1ecb183 100644
      const std::string name =
          prefix + "/" + fs::relative(path, source, error).generic_string();
      if (error || !AddFileToZip(&writer, path, name)) {
-@@ -2755,7 +3019,7 @@ bool CreateZip(const fs::path &source, const fs::path &archive,
+@@ -2755,7 +3030,7 @@ bool CreateZip(const fs::path &source, const fs::path &archive,
  
  std::string PublicPath(const fs::path &path) {
    const std::string native = path.string();
@@ -419,7 +430,7 @@ index 9d6696d..1ecb183 100644
    if (native.rfind(root, 0u) == 0u) {
      return "/sdcard" + native.substr(root.size());
    }
-@@ -2783,12 +3047,14 @@ bool CopyApksAndManifests(const std::vector<int> &apk_fds,
+@@ -2783,12 +3058,14 @@ bool CopyApksAndManifests(const std::vector<int> &apk_fds,
        *detail = "copy_apk_failed";
        return false;
      }
@@ -436,7 +447,7 @@ index 9d6696d..1ecb183 100644
      }
    }
    Json::Value index(Json::objectValue);
-@@ -2798,20 +3064,82 @@ bool CopyApksAndManifests(const std::vector<int> &apk_fds,
+@@ -2798,20 +3075,83 @@ bool CopyApksAndManifests(const std::vector<int> &apk_fds,
    return WriteText(staging / "jadx-input.json", JsonText(index));
  }
  
@@ -498,10 +509,12 @@ index 9d6696d..1ecb183 100644
  
  Status ExportLatest(const fs::path &storage_root,
                      const fs::path &downloads_root,
-                     std::string_view package_name,
+-                    std::string_view package_name,
 -                    const std::vector<int> &apk_fds, ExportSummary *summary) {
++                    const TargetIdentity &identity,
 +                    const std::vector<int> &apk_fds, ExportSummary *summary,
 +                    const ExportProgressSink sink, void *context) {
++  const std::string_view package_name = identity.package_name;
    if (summary == nullptr || !IsValidPackageName(package_name) ||
        apk_fds.empty() || apk_fds.size() > 32u) {
      return Status::kProtocolError;
@@ -523,7 +536,7 @@ index 9d6696d..1ecb183 100644
    auto candidate = FindConfiguredRun(runs);
    if (!candidate.has_value()) {
      candidate = FindLatestRun(runs);
-@@ -2823,6 +3151,9 @@ Status ExportLatest(const fs::path &storage_root,
+@@ -2823,6 +3163,9 @@ Status ExportLatest(const fs::path &storage_root,
    summary->run_id = candidate->run_id;
    summary->remote_artifact_count = candidate->artifact_count;
  
@@ -533,7 +546,7 @@ index 9d6696d..1ecb183 100644
    std::error_code error;
    const fs::path package_output =
        downloads_root / "r0dump-exports" / std::string(package_name);
-@@ -2839,14 +3170,31 @@ Status ExportLatest(const fs::path &storage_root,
+@@ -2839,14 +3182,31 @@ Status ExportLatest(const fs::path &storage_root,
        std::to_string(
            std::chrono::steady_clock::now().time_since_epoch().count());
    const fs::path staging = package_output / unique;
@@ -566,7 +579,7 @@ index 9d6696d..1ecb183 100644
  
    Json::Value process_reports(Json::arrayValue);
    std::vector<fs::path> processes;
-@@ -2859,7 +3207,16 @@ Status ExportLatest(const fs::path &storage_root,
+@@ -2859,7 +3219,16 @@ Status ExportLatest(const fs::path &storage_root,
      error.clear();
    }
    std::sort(processes.begin(), processes.end());
@@ -583,7 +596,73 @@ index 9d6696d..1ecb183 100644
      const fs::path repair = process / "host-repair";
      const ProcessSummary result = RepairProcess(process, repair);
      summary->record_count += result.record_count;
-@@ -2903,46 +3260,115 @@ Status ExportLatest(const fs::path &storage_root,
+@@ -2888,6 +3257,65 @@ Status ExportLatest(const fs::path &storage_root,
+     return Status::kRepairFailed;
+   }
+ 
++  // A packed target hands over finished DEX blobs, not per-method fragments.
++  // Collect them into dex/ with real names and record what they are, otherwise
++  // the archive holds nothing a human can double-click.
++  struct CollectedDex {
++    std::string source;
++    std::string output;
++    uint64_t bytes = 0u;
++  };
++  std::vector<CollectedDex> collected_dex;
++  {
++    std::error_code dex_error;
++    std::vector<fs::path> dex_candidates;
++    for (const fs::directory_entry &entry :
++         fs::recursive_directory_iterator(staging, dex_error)) {
++      if (dex_error) {
++        break;
++      }
++      const std::string name = entry.path().filename().string();
++      if (entry.is_regular_file(dex_error) &&
++          name.find(".dex.raw") != std::string::npos) {
++        dex_candidates.push_back(entry.path());
++      }
++    }
++    std::sort(dex_candidates.begin(), dex_candidates.end());
++    const fs::path dex_directory = staging / "dex";
++    fs::create_directories(dex_directory, dex_error);
++    dex_error.clear();
++    chmod(dex_directory.c_str(), kDirectoryMode);
++    for (const fs::path &candidate : dex_candidates) {
++      std::vector<uint8_t> data;
++      if (!ReadFile(candidate, &data) || data.size() < 112u) {
++        continue;
++      }
++      // Only publish blobs whose header checks out; a fragment is not a DEX.
++      if (memcmp(data.data(), "dex\n", 4u) != 0) {
++        continue;
++      }
++      const uint32_t declared =
++          static_cast<uint32_t>(data[32]) | (static_cast<uint32_t>(data[33]) << 8) |
++          (static_cast<uint32_t>(data[34]) << 16) |
++          (static_cast<uint32_t>(data[35]) << 24);
++      if (declared != data.size()) {
++        continue;
++      }
++      const std::string stem = candidate.stem().stem().string();
++      const std::string output_name = std::to_string(collected_dex.size() + 1u) +
++                                      "-" + stem + ".dex";
++      const fs::path output = dex_directory / output_name;
++      if (!WriteFile(output, data)) {
++        continue;
++      }
++      chmod(output.c_str(), kFileMode);
++      collected_dex.push_back(
++          CollectedDex{fs::relative(candidate, staging, dex_error).generic_string(),
++                       "dex/" + output_name, data.size()});
++      dex_error.clear();
++    }
++  }
++
+   Json::Value export_report(Json::objectValue);
+   export_report["schema"] = 1;
+   export_report["algorithm_version"] = kAlgorithmVersion;
+@@ -2903,46 +3331,178 @@ Status ExportLatest(const fs::path &storage_root,
      return Status::kRepairFailed;
    }
  
@@ -709,6 +788,69 @@ index 9d6696d..1ecb183 100644
 -  chmod(final_zip.c_str(), kFileMode);
    chmod(final_sha.c_str(), kFileMode);
 +
++  // README is what makes the archive usable without reverse-engineering our
++  // directory layout: what was captured, which DEX are real, how to open them.
++  {
++    Json::Value index(Json::objectValue);
++    index["schema"] = 1;
++    index["package"] = std::string(package_name);
++    index["run_id"] = candidate->run_id;
++    index["captured_at_utc"] = candidate->run_id.substr(0u, 15);
++    Json::Value dex_list(Json::arrayValue);
++    for (const CollectedDex &item : collected_dex) {
++      Json::Value entry(Json::objectValue);
++      entry["file"] = item.output;
++      entry["source"] = item.source;
++      entry["bytes"] = static_cast<Json::UInt64>(item.bytes);
++      dex_list.append(std::move(entry));
++    }
++    index["dex_files"] = dex_list;
++    index["dex_count"] = static_cast<Json::UInt>(collected_dex.size());
++    index["version_name"] = identity.version_name;
++    index["label"] = identity.label;
++    index["launcher_activity"] = identity.launcher_activity;
++    index["base_apk"] = "apk/base.apk";
++    index["base_manifest"] = "manifest/AndroidManifest.xml";
++    index["jadx_command"] = "jadx -d out dex/";
++    WriteText(package_output / (candidate->run_id + ".dex-index.json"), JsonText(index));
++    chmod((package_output / (candidate->run_id + ".dex-index.json")).c_str(),
++          kFileMode);
++
++    // The README is what makes the archive usable without reverse-engineering
++    // our directory layout: what was captured, which DEX are real, how to open.
++    std::string readme = "# " + identity.package_name;
++    if (!identity.label.empty()) {
++      readme += " (" + identity.label + ")";
++    }
++    readme += "\n\n";
++    readme += "- 版本: " +
++              (identity.version_name.empty() ? std::string("-")
++                                             : identity.version_name) +
++              "\n";
++    readme += "- 入口 Activity: " +
++              (identity.launcher_activity.empty()
++                   ? std::string("(未声明)")
++                   : identity.launcher_activity) +
++              "\n";
++    readme += "- 运行 ID: " + candidate->run_id + "\n";
++    readme += "- DEX 数量: " + std::to_string(collected_dex.size()) + "\n\n";
++    readme += "## 产物\n\n```\n";
++    readme += "dex/                    可直接打开的 DEX\n";
++    readme += "apk/base.apk            原始 APK\n";
++    readme += "manifest/               二进制 AndroidManifest.xml\n";
++    readme += "process-*/artifacts/    原始捕获块（含 codeitem 片段）\n";
++    readme += "process-*/records.jsonl 每次捕获观测\n";
++    readme += "```\n\n## 打开方式\n\n```bash\njadx -d out dex/\n```\n\n";
++    readme += "## DEX 清单\n\n";
++    for (const CollectedDex &item : collected_dex) {
++      readme += "- `" + item.output + "` — " + std::to_string(item.bytes) +
++                " 字节\n";
++    }
++    const fs::path readme_path = package_output / (candidate->run_id + ".README.md");
++    WriteText(readme_path, readme);
++    chmod(readme_path.c_str(), kFileMode);
++  }
++
    fs::remove_all(staging, error);
 -  summary->archive_path = PublicPath(final_zip);
 +  // Keep summary->sha256 single-valued for the wire protocol; the full list
@@ -723,13 +865,22 @@ index 9d6696d..1ecb183 100644
  }
  
 diff --git a/helper/r0dump_export_core.h b/helper/r0dump_export_core.h
-index da05342..bcfb71f 100644
+index da05342..deea6a2 100644
 --- a/helper/r0dump_export_core.h
 +++ b/helper/r0dump_export_core.h
-@@ -25,13 +25,20 @@ struct ExportSummary {
+@@ -25,13 +25,29 @@ struct ExportSummary {
    std::string detail;
  };
  
++// What the caller knows about the target and the helper cannot derive:
++// version, display label and the launcher activity to name in the index.
++struct TargetIdentity {
++  std::string package_name;
++  std::string version_name;
++  std::string label;
++  std::string launcher_activity;
++};
++
 +// Receives every progress update. The helper points this at the export socket
 +// so the Manager sees live counters instead of one blocking call.
 +using ExportProgressSink = void (*)(void *context, const char *stage, int percent,
@@ -740,8 +891,9 @@ index da05342..bcfb71f 100644
  // apk_fds must contain base.apk first, followed by optional split APKs.
  Status ExportLatest(const std::filesystem::path &storage_root,
                      const std::filesystem::path &downloads_root,
-                     std::string_view package_name,
+-                    std::string_view package_name,
 -                    const std::vector<int> &apk_fds, ExportSummary *summary);
++                    const TargetIdentity &identity,
 +                    const std::vector<int> &apk_fds, ExportSummary *summary,
 +                    ExportProgressSink progress_sink = nullptr,
 +                    void *progress_context = nullptr);
@@ -749,7 +901,7 @@ index da05342..bcfb71f 100644
  } // namespace r0dump::file_helper
  
 diff --git a/helper/r0dump_file_helper.cpp b/helper/r0dump_file_helper.cpp
-index 04da4d5..6d5f571 100644
+index 04da4d5..1ba9b34 100644
 --- a/helper/r0dump_file_helper.cpp
 +++ b/helper/r0dump_file_helper.cpp
 @@ -25,8 +25,8 @@
@@ -763,12 +915,21 @@ index 04da4d5..6d5f571 100644
  constexpr char kPropertyPrefix[] = "persist.sys.r0dump.fusion.";
  constexpr size_t kMaxApkCount = 32u;
  
-@@ -125,6 +125,24 @@ bool SendExportResponse(int client_fd, Status status,
+@@ -125,6 +125,33 @@ bool SendExportResponse(int client_fd, Status status,
           static_cast<ssize_t>(sizeof(response));
  }
  
 +// Progress frames are best effort: a client that stopped reading must not abort
 +// an export that is already minutes into its work.
++// Reads a fixed-width field that may legitimately be empty.
++std::string OptionalField(const char *value, size_t capacity) {
++  size_t length = 0u;
++  while (length < capacity && value[length] != '\0') {
++    ++length;
++  }
++  return std::string(value, length);
++}
++
 +void SendExportProgressFrame(void *context, const char *stage, int percent,
 +                             uint64_t done, uint64_t total) {
 +  const int client_fd =
@@ -788,19 +949,45 @@ index 04da4d5..6d5f571 100644
  void CloseFds(const std::vector<int> &fds) {
    for (int fd : fds) {
      if (fd >= 0)
-@@ -157,8 +175,10 @@ void RunExport(int client_fd, ExportRequest request, std::vector<int> apk_fds) {
+@@ -157,8 +184,22 @@ void RunExport(int client_fd, ExportRequest request, std::vector<int> apk_fds) {
    if (ReadFixedString(request.package_name, sizeof(request.package_name),
                        &package_name) &&
        IsValidPackageName(package_name)) {
 -    status = ExportLatest(kStorageRoot, kDownloadsRoot, package_name, apk_fds,
 -                          &summary);
++    TargetIdentity identity;
++    identity.package_name = std::string(package_name);
++    // These are optional: a target without a version name or launcher activity
++    // must still export, so read them leniently instead of failing the request.
++    identity.version_name = OptionalField(request.version_name,
++                                          sizeof(request.version_name));
++    identity.label = OptionalField(request.label, sizeof(request.label));
++    identity.launcher_activity = OptionalField(
++        request.launcher_activity, sizeof(request.launcher_activity));
++    ALOGI("r0dump identity diag pkg=%s version=%s label=%s launcher=%s",
++          identity.package_name.c_str(), identity.version_name.c_str(),
++          identity.label.c_str(), identity.launcher_activity.c_str());
 +    status = ExportLatest(
-+        kStorageRoot, kDownloadsRoot, package_name, apk_fds, &summary,
++        kStorageRoot, kDownloadsRoot, identity, apk_fds, &summary,
 +        &SendExportProgressFrame,
 +        reinterpret_cast<void *>(static_cast<intptr_t>(client_fd)));
    } else {
      summary.detail = "invalid_package";
    }
+@@ -183,7 +224,12 @@ bool HandleClient(int client_fd) {
+     return true;
+   }
+ 
+-  std::array<uint8_t, sizeof(Request)> request_bytes{};
++  // Both request kinds share this reader; size the buffer for the larger one or
++  // the export request gets truncated (its trailing fields read back as empty).
++  constexpr size_t kRequestBufferBytes =
++      sizeof(ExportRequest) > sizeof(Request) ? sizeof(ExportRequest)
++                                              : sizeof(Request);
++  std::array<uint8_t, kRequestBufferBytes> request_bytes{};
+   alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int) * kMaxApkCount)] = {};
+   iovec io = {.iov_base = request_bytes.data(),
+               .iov_len = request_bytes.size()};
 diff --git a/helper/r0dump_file_helper.rc b/helper/r0dump_file_helper.rc
 index 1d91b63..4f948c7 100644
 --- a/helper/r0dump_file_helper.rc
@@ -1071,10 +1258,10 @@ index 657edfb..9931756 100644
        RemovePreparedBranch(process_directory.get(), run_directory.get(),
                             process_directory_name);
 diff --git a/helper/r0dump_file_helper_protocol.h b/helper/r0dump_file_helper_protocol.h
-index 2c642c0..1f14fca 100644
+index 2c642c0..ffabf68 100644
 --- a/helper/r0dump_file_helper_protocol.h
 +++ b/helper/r0dump_file_helper_protocol.h
-@@ -11,6 +11,7 @@ inline constexpr uint16_t kProtocolVersion = 1u;
+@@ -11,12 +11,16 @@ inline constexpr uint16_t kProtocolVersion = 1u;
  inline constexpr uint32_t kExportProtocolMagic = 0x52304558u; // R0EX
  inline constexpr uint16_t kExportProtocolVersion = 1u;
  inline constexpr uint32_t kExportResponseMagic = 0x52304552u; // R0ER
@@ -1082,10 +1269,24 @@ index 2c642c0..1f14fca 100644
  inline constexpr size_t kPackageBytes = 96u;
  inline constexpr size_t kProcessBytes = 96u;
  inline constexpr size_t kRunIdBytes = 65u;
-@@ -66,6 +67,19 @@ struct ExportRequest {
-   char package_name[kPackageBytes];
- };
+ inline constexpr size_t kArchivePathBytes = 256u;
+ inline constexpr size_t kSha256Bytes = 65u;
+ inline constexpr size_t kExportDetailBytes = 256u;
++// Human-facing identity of the target: what to run and what to open.
++inline constexpr size_t kLabelBytes = 128u;
++inline constexpr size_t kComponentBytes = 256u;
  
+ enum class Status : int32_t {
+   kOk = 0,
+@@ -64,6 +68,22 @@ struct ExportRequest {
+   uint32_t requester_uid;
+   uint32_t apk_count;
+   char package_name[kPackageBytes];
++  char version_name[kLabelBytes];
++  char label[kLabelBytes];
++  char launcher_activity[kComponentBytes];
++};
++
 +// An export runs for tens of minutes on a packed target. The helper streams
 +// these frames over the same SEQPACKET connection while it works, so the caller
 +// only has to read until the ExportResponse arrives.
@@ -1097,14 +1298,15 @@ index 2c642c0..1f14fca 100644
 +  uint64_t done;
 +  uint64_t total;
 +  char stage[32];
-+};
-+
+ };
+ 
  struct ExportResponse {
-   uint32_t magic;
-   uint16_t version;
-@@ -89,6 +103,7 @@ static_assert(sizeof(Request) == 285u);
+@@ -87,8 +107,9 @@ struct ExportResponse {
+ 
+ static_assert(sizeof(Request) == 285u);
  static_assert(sizeof(Response) == 12u);
- static_assert(sizeof(ExportRequest) == 116u);
+-static_assert(sizeof(ExportRequest) == 116u);
++static_assert(sizeof(ExportRequest) == 628u);
  static_assert(sizeof(ExportResponse) == 682u);
 +static_assert(sizeof(ExportProgressFrame) == 60u);
  
