@@ -1,5 +1,5 @@
 diff --git a/helper/r0dump_export_core.cpp b/helper/r0dump_export_core.cpp
-index 9d6696d..1b74192 100644
+index 9d6696d..1ecb183 100644
 --- a/helper/r0dump_export_core.cpp
 +++ b/helper/r0dump_export_core.cpp
 @@ -1,5 +1,9 @@
@@ -361,35 +361,56 @@ index 9d6696d..1b74192 100644
    return true;
  }
  
-@@ -2711,7 +2970,8 @@ bool AddFileToZip(ZipWriter *writer, const fs::path &file,
+@@ -2710,8 +2969,17 @@ bool AddFileToZip(ZipWriter *writer, const fs::path &file,
+   return (input.eof() || input.good()) && writer->FinishEntry() == 0;
  }
  
- bool CreateZip(const fs::path &source, const fs::path &archive,
+-bool CreateZip(const fs::path &source, const fs::path &archive,
 -               const std::string &prefix) {
++// libziparchive writes classic ZIP, whose central directory stores the entry
++// count in 16 bits and has no ZIP64 writer. A packed target routinely exceeds
++// that: 98,201 entries silently lost their tail and the export then spent
++// minutes deleting the staging tree. Cap each archive below the limit and spill
++// into numbered volumes instead.
++constexpr size_t kMaxEntriesPerVolume = 65000u;
++
++bool CreateZip(const fs::path &source, const std::vector<fs::path> &files,
++               size_t first, size_t count, const fs::path &archive,
 +               const std::string &prefix, const ExportProgressSink sink,
-+               void *context) {
++               void *context, size_t archive_total, size_t archive_base) {
    FILE *file = fopen(archive.c_str(), "wb");
    if (file == nullptr) {
      return false;
-@@ -2731,7 +2991,17 @@ bool CreateZip(const fs::path &source, const fs::path &archive,
-     }
-   }
-   std::sort(files.begin(), files.end());
-+  // Archiving thousands of small files dominates the tail of an export.
-+  const size_t archive_total = files.size();
-+  size_t archive_done = 0;
-   for (const fs::path &path : files) {
-+    if ((archive_done & 0x3f) == 0u && archive_total > 0u) {
+@@ -2719,19 +2987,15 @@ bool CreateZip(const fs::path &source, const fs::path &archive,
+   ZipWriter writer(file);
+   bool ok = true;
+   std::error_code error;
+-  std::vector<fs::path> files;
+-  for (const fs::directory_entry &entry :
+-       fs::recursive_directory_iterator(source, error)) {
+-    if (error || entry.is_symlink(error)) {
+-      ok = false;
+-      break;
+-    }
+-    if (entry.is_regular_file(error)) {
+-      files.push_back(entry.path());
+-    }
+-  }
+-  std::sort(files.begin(), files.end());
+-  for (const fs::path &path : files) {
++  const size_t last = first + count;
++  for (size_t index = first; index < last; ++index) {
++    if (((index - archive_base) & 0x3f) == 0u && archive_total > 0u) {
 +      r0dump_WriteExportProgress(
 +          sink, context, "archiving",
-+          80 + static_cast<int>((archive_done * 20) / archive_total), archive_done,
-+          archive_total);
++          80 + static_cast<int>(((index - archive_base) * 20) / archive_total),
++          index - archive_base, archive_total);
 +    }
-+    archive_done++;
++    const fs::path &path = files[index];
      const std::string name =
          prefix + "/" + fs::relative(path, source, error).generic_string();
      if (error || !AddFileToZip(&writer, path, name)) {
-@@ -2755,7 +3025,7 @@ bool CreateZip(const fs::path &source, const fs::path &archive,
+@@ -2755,7 +3019,7 @@ bool CreateZip(const fs::path &source, const fs::path &archive,
  
  std::string PublicPath(const fs::path &path) {
    const std::string native = path.string();
@@ -398,7 +419,7 @@ index 9d6696d..1b74192 100644
    if (native.rfind(root, 0u) == 0u) {
      return "/sdcard" + native.substr(root.size());
    }
-@@ -2783,12 +3053,14 @@ bool CopyApksAndManifests(const std::vector<int> &apk_fds,
+@@ -2783,12 +3047,14 @@ bool CopyApksAndManifests(const std::vector<int> &apk_fds,
        *detail = "copy_apk_failed";
        return false;
      }
@@ -415,7 +436,7 @@ index 9d6696d..1b74192 100644
      }
    }
    Json::Value index(Json::objectValue);
-@@ -2798,20 +3070,82 @@ bool CopyApksAndManifests(const std::vector<int> &apk_fds,
+@@ -2798,20 +3064,82 @@ bool CopyApksAndManifests(const std::vector<int> &apk_fds,
    return WriteText(staging / "jadx-input.json", JsonText(index));
  }
  
@@ -502,7 +523,7 @@ index 9d6696d..1b74192 100644
    auto candidate = FindConfiguredRun(runs);
    if (!candidate.has_value()) {
      candidate = FindLatestRun(runs);
-@@ -2823,6 +3157,9 @@ Status ExportLatest(const fs::path &storage_root,
+@@ -2823,6 +3151,9 @@ Status ExportLatest(const fs::path &storage_root,
    summary->run_id = candidate->run_id;
    summary->remote_artifact_count = candidate->artifact_count;
  
@@ -512,7 +533,7 @@ index 9d6696d..1b74192 100644
    std::error_code error;
    const fs::path package_output =
        downloads_root / "r0dump-exports" / std::string(package_name);
-@@ -2839,14 +3176,31 @@ Status ExportLatest(const fs::path &storage_root,
+@@ -2839,14 +3170,31 @@ Status ExportLatest(const fs::path &storage_root,
        std::to_string(
            std::chrono::steady_clock::now().time_since_epoch().count());
    const fs::path staging = package_output / unique;
@@ -545,7 +566,7 @@ index 9d6696d..1b74192 100644
  
    Json::Value process_reports(Json::arrayValue);
    std::vector<fs::path> processes;
-@@ -2859,7 +3213,16 @@ Status ExportLatest(const fs::path &storage_root,
+@@ -2859,7 +3207,16 @@ Status ExportLatest(const fs::path &storage_root,
      error.clear();
    }
    std::sort(processes.begin(), processes.end());
@@ -562,16 +583,145 @@ index 9d6696d..1b74192 100644
      const fs::path repair = process / "host-repair";
      const ProcessSummary result = RepairProcess(process, repair);
      summary->record_count += result.record_count;
-@@ -2913,7 +3276,8 @@ Status ExportLatest(const fs::path &storage_root,
-   unlink(temporary_zip.c_str());
-   unlink(temporary_sha.c_str());
-   if (!CreateZip(staging, temporary_zip,
+@@ -2903,46 +3260,115 @@ Status ExportLatest(const fs::path &storage_root,
+     return Status::kRepairFailed;
+   }
+ 
+-  const fs::path temporary_zip =
+-      package_output / ("." + candidate->run_id + ".zip.partial");
+-  const fs::path final_zip = package_output / (candidate->run_id + ".zip");
+-  const fs::path temporary_sha =
+-      package_output / ("." + candidate->run_id + ".zip.sha256.partial");
+-  const fs::path final_sha =
+-      package_output / (candidate->run_id + ".zip.sha256");
+-  unlink(temporary_zip.c_str());
+-  unlink(temporary_sha.c_str());
+-  if (!CreateZip(staging, temporary_zip,
 -                 std::string(package_name) + "/" + candidate->run_id)) {
-+                 std::string(package_name) + "/" + candidate->run_id, sink,
-+                 context)) {
-     summary->detail = "create_archive_failed";
+-    summary->detail = "create_archive_failed";
++  std::vector<fs::path> archived;
++  std::error_code walk_error;
++  for (const fs::directory_entry &entry :
++       fs::recursive_directory_iterator(staging, walk_error)) {
++    if (walk_error) {
++      break;
++    }
++    if (entry.is_regular_file(walk_error)) {
++      archived.push_back(entry.path());
++    }
++  }
++  std::sort(archived.begin(), archived.end());
++  if (walk_error) {
++    summary->detail = "enumerate_staging_failed";
      fs::remove_all(staging, error);
      return Status::kArchiveFailed;
+   }
+-  summary->sha256 = Sha256File(temporary_zip);
+-  if (summary->sha256.empty() ||
+-      !WriteText(temporary_sha, summary->sha256 + "  " +
+-                                    final_zip.filename().string() + "\n")) {
+-    summary->detail = "create_checksum_failed";
++
++  // Spill into numbered volumes so no archive exceeds the classic-ZIP entry cap.
++  const std::string prefix = std::string(package_name) + "/" + candidate->run_id;
++  const size_t volume_count =
++      archived.empty() ? 1u
++                       : (archived.size() + kMaxEntriesPerVolume - 1u) /
++                             kMaxEntriesPerVolume;
++  std::vector<fs::path> published;
++  std::string checksums;
++  for (size_t volume = 0u; volume < volume_count; ++volume) {
++    const size_t first = volume * kMaxEntriesPerVolume;
++    const size_t count =
++        std::min(kMaxEntriesPerVolume, archived.size() - first);
++    const std::string suffix =
++        volume_count == 1u ? "" : "-part" + std::to_string(volume + 1u);
++    const fs::path final_zip =
++        package_output / (candidate->run_id + suffix + ".zip");
++    const fs::path temporary_zip =
++        package_output / ("." + candidate->run_id + suffix + ".zip.partial");
+     unlink(temporary_zip.c_str());
++    if (!CreateZip(staging, archived, first, count, temporary_zip, prefix, sink,
++                   context, archived.size(), first)) {
++      summary->detail = "create_archive_failed";
++      for (const fs::path &path : published) {
++        unlink(path.c_str());
++      }
++      unlink(temporary_zip.c_str());
++      fs::remove_all(staging, error);
++      return Status::kArchiveFailed;
++    }
++    const std::string digest = Sha256File(temporary_zip);
++    if (digest.empty()) {
++      summary->detail = "create_checksum_failed";
++      for (const fs::path &path : published) {
++        unlink(path.c_str());
++      }
++      unlink(temporary_zip.c_str());
++      fs::remove_all(staging, error);
++      return Status::kArchiveFailed;
++    }
++    checksums += digest + "  " + final_zip.filename().string() + "\n";
++    unlink(final_zip.c_str());
++    if (rename(temporary_zip.c_str(), final_zip.c_str()) != 0) {
++      summary->detail = "publish_archive_failed";
++      for (const fs::path &path : published) {
++        unlink(path.c_str());
++      }
++      unlink(temporary_zip.c_str());
++      fs::remove_all(staging, error);
++      return Status::kArchiveFailed;
++    }
++    chmod(final_zip.c_str(), kFileMode);
++    published.push_back(final_zip);
++  }
++
++  // One .sha256 file lists every volume, so a multi-part export still verifies
++  // with a single `sha256sum -c`.
++  const fs::path final_sha =
++      package_output / (candidate->run_id + ".zip.sha256");
++  const fs::path temporary_sha =
++      package_output / ("." + candidate->run_id + ".zip.sha256.partial");
++  unlink(temporary_sha.c_str());
++  if (!WriteText(temporary_sha, checksums)) {
++    summary->detail = "create_checksum_failed";
++    for (const fs::path &path : published) {
++      unlink(path.c_str());
++    }
+     unlink(temporary_sha.c_str());
+     fs::remove_all(staging, error);
+     return Status::kArchiveFailed;
+   }
+-  unlink(final_zip.c_str());
+   unlink(final_sha.c_str());
+-  if (rename(temporary_zip.c_str(), final_zip.c_str()) != 0 ||
+-      rename(temporary_sha.c_str(), final_sha.c_str()) != 0) {
++  if (rename(temporary_sha.c_str(), final_sha.c_str()) != 0) {
+     summary->detail = "publish_archive_failed";
+-    unlink(temporary_zip.c_str());
++    for (const fs::path &path : published) {
++      unlink(path.c_str());
++    }
+     unlink(temporary_sha.c_str());
+     fs::remove_all(staging, error);
+     return Status::kArchiveFailed;
+   }
+-  chmod(final_zip.c_str(), kFileMode);
+   chmod(final_sha.c_str(), kFileMode);
++
+   fs::remove_all(staging, error);
+-  summary->archive_path = PublicPath(final_zip);
++  // Keep summary->sha256 single-valued for the wire protocol; the full list
++  // lives in the .sha256 file next to the archives.
++  summary->sha256 = checksums.substr(0u, 64u);
++  summary->archive_path = PublicPath(published.front());
+   summary->detail = "ok";
++  if (volume_count > 1u) {
++    summary->detail = "ok_split_" + std::to_string(volume_count) + "_volumes";
++  }
+   return Status::kOk;
+ }
+ 
 diff --git a/helper/r0dump_export_core.h b/helper/r0dump_export_core.h
 index da05342..bcfb71f 100644
 --- a/helper/r0dump_export_core.h

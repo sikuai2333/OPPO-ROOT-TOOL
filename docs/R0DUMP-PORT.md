@@ -216,6 +216,33 @@ Manager 侧改为逐数据报读取、按 magic 分发，而不是假设「一�
 
 界面上数字同步递增，阶段切换正确。
 
+### 9.5 打包阶段的两个坑
+
+**坑一：ZIP 条目数上限 65,535。** 打包目标有 98,201 个文件，两次导出都精确停在 `done=65472`（65472 + 63 对齐 = 65535）然后开始删 staging，观感上像死锁。根因在 `system/libziparchive`：
+
+```cpp
+// zip_writer.cc:483
+// We haven't supported zip64 format yet.
+```
+
+修复是分卷：每卷最多 65,000 条目，超出时输出 `run-id.zip` + `run-id-part2.zip`，`.sha256` 文件列出所有分卷，`sha256sum -c` 一次校验全部。
+
+**坑二：`fs::remove_all(staging)` 在 FUSE 上极慢。** 十万个小文件逐个 `unlink`，每个都要触发一次 `fuse_flush_times` 元数据回写。导出失败后的清理本身能跑十几分钟，把「失败」伪装成「卡住」。判断方法：
+
+```bash
+# 文件数在减少 = 在清理；完全不动 = 真死锁
+find <staging> -type f | wc -l
+cat /proc/<helper-pid>/task/*/stack | grep fuse_
+```
+
+看到 `fuse_unlink` 就是清理阶段，不是打包。
+
+**坑三（顺带）：`export_busy` 清理。** 导出异常中断后 `g_export_in_progress` 留成 true，后续调用一直返回 `status=11`。需 root 重启 helper：
+
+```bash
+adb root && adb shell "stop r0dump_file_helper; start r0dump_file_helper"
+```
+
 ## 10. 用 MCP 桥驱动（不用点屏幕）
 
 Manager 内置一个 MCP（JSON-RPC 2.0）服务，走抽象命名空间 unix socket `@r0dump_mcp`，设备上有对应的桥接二进制：

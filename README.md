@@ -59,7 +59,7 @@ m systemimage -j8 && m superimage -j8
 
 把 [r0dump](https://github.com/tiwe0/r0dump) 的 A16 补丁集移植到本机，并修掉上游没覆盖的部分（缺失的 libcore 桥接类、`core_platform` stub 陷阱、sdcardfs 兼容、ART 预算上限）。
 
-实测结果：对抽取壳样本捕获 **50,572 个 codeitem**，抽检 32 个全部为合法 Dalvik 字节码。导出文件数从 316,609 压到 30,990。
+实测结果：对抽取壳样本捕获 **50,572 个 codeitem**，抽检 32 个全部为合法 Dalvik 字节码。导出文件数从 316,609 压到 30,990；导出过程带 `done/total` 实时进度条，超过 65,000 条目自动分卷打包。
 
 能力边界要说清楚：整壳与抽取壳可自动还原；**VMP 与 DEX2C 只能识别缺口，无法自动还原**。
 
