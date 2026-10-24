@@ -162,7 +162,61 @@ total:    30990        # 原 316,609，减少 90%
 
 导出四阶段进度写在 `/storage/emulated/0/Downloads/r0dump-export-progress.json`。
 
-## 9. 用 MCP 桥驱动（不用点屏幕）
+## 9. 进度条：从假的 10% 到可观测
+
+第一版只在进入复制阶段时写一次 `{"stage":"copying","percent":10}`。打包目标的复制要走过近十万个文件、跑上几十分钟，这个值全程不变——观感和卡死完全一样。
+
+修复分两层。
+
+### 9.1 进度必须带分母
+
+```cpp
+void r0dump_WriteExportProgress(const char *stage, int percent, uint64_t done,
+                                uint64_t total);
+```
+
+- `copying`：先扫一遍源目录算出 `expected_files`，之后每 256 个文件上报一次
+- `repairing`：`done` = 已完成进程数，`total` = 总进程数
+- `archiving`：`done` = 已打包文件数，`total` = 总文件数
+
+### 9.2 跨进程传递：复用导出 socket
+
+helper 只接受 system uid 的连接（`peer.uid != AID_SYSTEM` 拒绝），Manager 既连不上它的 socket，也读不到 `/sdcard/Downloads` 下的进度文件。所以进度只能由 helper 沿导出连接送回来。
+
+导出本来就是 SEQPACKET，天然分帧，加一个进度帧即可：
+
+```cpp
+struct ExportProgressFrame {
+  uint32_t magic;   // 'R0EP'
+  uint16_t version;
+  uint16_t size;    // 60
+  int32_t  percent;
+  uint64_t done;
+  uint64_t total;
+  char     stage[32];
+};
+```
+
+callback 通过 `ExportLatest(..., sink, context)` 一路传到 `CopyTree` / `CreateZip`，context 就是 client fd。
+
+Manager 侧改为逐数据报读取、按 magic 分发，而不是假设「一次读满固定长度」。UI 显示「阶段 · 百分比 · done / total」+ 确定性进度条。
+
+### 9.3 必须一起改的超时
+
+`r0dump_FilePreparationBridge` 的 `EXPORT_TIMEOUT_MS` 原本是 5 分钟。它此前形同虚设——`setSoTimeout` 只对 `read()` 生效，而旧实现写完之后不读。改成流式读进度帧后它会**真的触发**，把 30 分钟的正常导出掐断。已改为 30 分钟。
+
+### 9.4 验证
+
+```text
+{"stage":"copying","percent":10,"done":256,"total":98179,"pid":6027}
+{"stage":"copying","percent":10,"done":2816,"total":98179,"pid":6027}   ← 24 秒后
+...
+{"stage":"archiving","percent":84,"done":23680,"total":98201}
+```
+
+界面上数字同步递增，阶段切换正确。
+
+## 10. 用 MCP 桥驱动（不用点屏幕）
 
 Manager 内置一个 MCP（JSON-RPC 2.0）服务，走抽象命名空间 unix socket `@r0dump_mcp`，设备上有对应的桥接二进制：
 
@@ -176,7 +230,12 @@ adb shell "r0dump_mcp_bridge < /data/local/tmp/req.jsonl"
 
 可用工具：`read_status`、`list_apps`、`set_config`、`enable`、`disable`、`launch_app`、`stop_app`、`recover`、`repair_export`。
 
-## 10. 能力边界
+两个注意点：
+
+- `launch_app` 会被 **BAL**（后台启动限制）拦住，必须先把 Manager 拉到前台再调用。
+- 导出异常中断后 `g_export_in_progress` 会留成 true，之后一直返回 `status=11 export_busy`。用 root 重启 helper 清除：`adb root && adb shell "stop r0dump_file_helper; start r0dump_file_helper"`。
+
+## 11. 能力边界
 
 | 壳类型 | 能否自动还原 |
 |---|---|
@@ -185,7 +244,7 @@ adb shell "r0dump_mcp_bridge < /data/local/tmp/req.jsonl"
 | VMP | **不能**，只能识别与统计缺口 |
 | DEX2C | **不能**，只能识别与统计缺口 |
 
-## 11. 刷入 update 时的两个注意点
+## 12. 刷入 update 时的两个注意点
 
 - `m systemimage` **不会**重建 `super.img`。改了 system 内容后必须再跑 `m superimage`，否则刷进去的还是旧镜像。
 - ART 是 **preload apex**（首阶段从 `/dev/block/dm-*` 挂载），`adb remount` 改 `/system/apex/com.android.art.capex` 不生效，必须整包刷 `super`。

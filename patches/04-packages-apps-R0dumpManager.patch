@@ -1,5 +1,5 @@
 diff --git a/helper/r0dump_export_core.cpp b/helper/r0dump_export_core.cpp
-index 9d6696d..968f142 100644
+index 9d6696d..1b74192 100644
 --- a/helper/r0dump_export_core.cpp
 +++ b/helper/r0dump_export_core.cpp
 @@ -1,5 +1,9 @@
@@ -12,8 +12,11 @@ index 9d6696d..968f142 100644
  #include "r0dump_file_helper_core.h"
  
  #include <fcntl.h>
-@@ -44,9 +48,13 @@ namespace fs = std::filesystem;
+@@ -42,11 +46,16 @@ namespace {
  
+ namespace fs = std::filesystem;
+ 
++
  constexpr char kAlgorithmVersion[] = "r0dump-device-repair-v1";
  constexpr size_t kDexHeaderSize = 0x70u;
 -constexpr uint64_t kMaxExportBytes = 2ull * 1024ull * 1024ull * 1024ull;
@@ -28,7 +31,7 @@ index 9d6696d..968f142 100644
  constexpr uint32_t kMaxMapItems = 4096u;
  constexpr mode_t kDirectoryMode = 02770;
  constexpr mode_t kFileMode = 0660;
-@@ -1956,6 +1964,50 @@ std::vector<fs::path> SortedJsonRecords(const fs::path &records) {
+@@ -1956,6 +1965,50 @@ std::vector<fs::path> SortedJsonRecords(const fs::path &records) {
    return paths;
  }
  
@@ -79,7 +82,7 @@ index 9d6696d..968f142 100644
  struct Discovered {
    std::string name;
    Json::Value record;
-@@ -1993,14 +2045,26 @@ ProcessSummary RepairProcess(const fs::path &process, const fs::path &output) {
+@@ -1993,14 +2046,26 @@ ProcessSummary RepairProcess(const fs::path &process, const fs::path &output) {
  
    std::vector<Discovered> discovered;
    std::map<std::string, std::set<std::string>> method_hashes;
@@ -112,7 +115,7 @@ index 9d6696d..968f142 100644
      entry.artifact = ArtifactPath(process, entry.record);
      if (entry.artifact.has_value()) {
        std::vector<uint8_t> data;
-@@ -2564,6 +2628,145 @@ std::optional<RunCandidate> FindConfiguredRun(const fs::path &runs) {
+@@ -2564,8 +2629,163 @@ std::optional<RunCandidate> FindConfiguredRun(const fs::path &runs) {
  #endif
  }
  
@@ -170,18 +173,30 @@ index 9d6696d..968f142 100644
 +}
 +
 +// Export runs for minutes on a packed target and the caller only sees a
-+// blocking call. Publish coarse stage progress where the Manager (and adb) can
-+// read it, so a long export is distinguishable from a hung one.
-+void r0dump_WriteExportProgress(const char *stage, int percent) {
++// blocking call. Publish stage progress where the Manager (and adb) can read
++// it, so a long export is distinguishable from a hung one.
++//
++// done/total are the units the current stage actually moves through (files
++// copied, processes repaired, files archived); total 0 means the stage cannot
++// report a denominator. percent stays the coarse overall estimate.
++
++void r0dump_WriteExportProgress(const ExportProgressSink sink, void *context,
++                                const char *stage, int percent, uint64_t done,
++                                uint64_t total) {
++  if (sink != nullptr) {
++    sink(context, stage, percent, done, total);
++  }
 +  const char *path = "/storage/emulated/0/Downloads/r0dump-export-progress.json";
 +  const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
 +  if (fd < 0) {
 +    return;
 +  }
-+  char buffer[128];
++  char buffer[192];
 +  const int n = snprintf(buffer, sizeof(buffer),
-+                         "{\"stage\":\"%s\",\"percent\":%d,\"pid\":%d}\n", stage,
-+                         percent, getpid());
++                         "{\"stage\":\"%s\",\"percent\":%d,\"done\":%llu,"
++                         "\"total\":%llu,\"pid\":%d}\n",
++                         stage, percent, static_cast<unsigned long long>(done),
++                         static_cast<unsigned long long>(total), getpid());
 +  if (n > 0) {
 +    ssize_t ignored = write(fd, buffer, static_cast<size_t>(n));
 +    (void)ignored;
@@ -255,11 +270,36 @@ index 9d6696d..968f142 100644
 +  return ok;
 +}
 +
++// Progress is published every kProgressStride files: often enough to look live,
++// sparse enough that the stat+write does not dominate a 45k-file copy.
++constexpr uint64_t kProgressStride = 256u;
++
  bool CopyTree(const fs::path &source, const fs::path &destination,
-               std::string *detail) {
+-              std::string *detail) {
++              std::string *detail, ExportProgressSink sink, void *context) {
    std::error_code error;
-@@ -2575,12 +2778,13 @@ bool CopyTree(const fs::path &source, const fs::path &destination,
+   fs::create_directories(destination, error);
+   if (error) {
+@@ -2573,14 +2793,31 @@ bool CopyTree(const fs::path &source, const fs::path &destination,
+     return false;
+   }
    chmod(destination.c_str(), kDirectoryMode);
++  // The copy pass dominates export wall time on a packed target, and it used to
++  // hold a flat "copying 10%" for the whole run. Count the files up front so the
++  // caller can show "n / total" while the copy is still in flight.
++  uint64_t expected_files = 0u;
++  {
++    std::error_code count_error;
++    for (fs::recursive_directory_iterator it(source, count_error), end;
++         it != end && !count_error; it.increment(count_error)) {
++      const fs::file_status status = it->symlink_status(count_error);
++      if (!count_error && fs::is_regular_file(status)) {
++        ++expected_files;
++      }
++    }
++  }
++  r0dump_WriteExportProgress(sink, context, "copying", 10, 0u, expected_files);
++  uint64_t copied_files = 0u;
    uint64_t total_bytes = 0u;
    uint32_t file_count = 0u;
 -  for (const fs::directory_entry &entry :
@@ -274,7 +314,7 @@ index 9d6696d..968f142 100644
      const fs::file_status status = entry.symlink_status(error);
      if (error || fs::is_symlink(status)) {
        *detail = "source_symlink_rejected";
-@@ -2593,6 +2797,25 @@ bool CopyTree(const fs::path &source, const fs::path &destination,
+@@ -2593,6 +2830,26 @@ bool CopyTree(const fs::path &source, const fs::path &destination,
      }
      const fs::path target = destination / relative;
      if (fs::is_directory(status)) {
@@ -294,13 +334,14 @@ index 9d6696d..968f142 100644
 +          return false;
 +        }
 +        chmod(packed.c_str(), kFileMode);
++        ++copied_files;
 +        it.disable_recursion_pending();
 +        continue;
 +      }
        fs::create_directory(target, error);
        if (error && error != std::errc::file_exists) {
          *detail = "create_staging_directory_failed";
-@@ -2614,9 +2837,7 @@ bool CopyTree(const fs::path &source, const fs::path &destination,
+@@ -2614,14 +2871,16 @@ bool CopyTree(const fs::path &source, const fs::path &destination,
        return false;
      }
      total_bytes += size;
@@ -311,7 +352,26 @@ index 9d6696d..968f142 100644
        *detail = "copy_source_failed";
        return false;
      }
-@@ -2731,7 +2952,15 @@ bool CreateZip(const fs::path &source, const fs::path &archive,
+     chmod(target.c_str(), kFileMode);
++    if ((++copied_files % kProgressStride) == 0u) {
++      r0dump_WriteExportProgress(sink, context, "copying", 10, copied_files, expected_files);
++    }
+   }
++  r0dump_WriteExportProgress(sink, context, "copying", 40, copied_files, expected_files);
+   return true;
+ }
+ 
+@@ -2711,7 +2970,8 @@ bool AddFileToZip(ZipWriter *writer, const fs::path &file,
+ }
+ 
+ bool CreateZip(const fs::path &source, const fs::path &archive,
+-               const std::string &prefix) {
++               const std::string &prefix, const ExportProgressSink sink,
++               void *context) {
+   FILE *file = fopen(archive.c_str(), "wb");
+   if (file == nullptr) {
+     return false;
+@@ -2731,7 +2991,17 @@ bool CreateZip(const fs::path &source, const fs::path &archive,
      }
    }
    std::sort(files.begin(), files.end());
@@ -320,14 +380,16 @@ index 9d6696d..968f142 100644
 +  size_t archive_done = 0;
    for (const fs::path &path : files) {
 +    if ((archive_done & 0x3f) == 0u && archive_total > 0u) {
-+      r0dump_WriteExportProgress("archiving",
-+                                 80 + static_cast<int>((archive_done * 20) / archive_total));
++      r0dump_WriteExportProgress(
++          sink, context, "archiving",
++          80 + static_cast<int>((archive_done * 20) / archive_total), archive_done,
++          archive_total);
 +    }
 +    archive_done++;
      const std::string name =
          prefix + "/" + fs::relative(path, source, error).generic_string();
      if (error || !AddFileToZip(&writer, path, name)) {
-@@ -2755,7 +2984,7 @@ bool CreateZip(const fs::path &source, const fs::path &archive,
+@@ -2755,7 +3025,7 @@ bool CreateZip(const fs::path &source, const fs::path &archive,
  
  std::string PublicPath(const fs::path &path) {
    const std::string native = path.string();
@@ -336,7 +398,7 @@ index 9d6696d..968f142 100644
    if (native.rfind(root, 0u) == 0u) {
      return "/sdcard" + native.substr(root.size());
    }
-@@ -2783,12 +3012,14 @@ bool CopyApksAndManifests(const std::vector<int> &apk_fds,
+@@ -2783,12 +3053,14 @@ bool CopyApksAndManifests(const std::vector<int> &apk_fds,
        *detail = "copy_apk_failed";
        return false;
      }
@@ -353,7 +415,7 @@ index 9d6696d..968f142 100644
      }
    }
    Json::Value index(Json::objectValue);
-@@ -2798,6 +3029,60 @@ bool CopyApksAndManifests(const std::vector<int> &apk_fds,
+@@ -2798,20 +3070,82 @@ bool CopyApksAndManifests(const std::vector<int> &apk_fds,
    return WriteText(staging / "jadx-input.json", JsonText(index));
  }
  
@@ -414,7 +476,13 @@ index 9d6696d..968f142 100644
  } // namespace
  
  Status ExportLatest(const fs::path &storage_root,
-@@ -2809,9 +3094,16 @@ Status ExportLatest(const fs::path &storage_root,
+                     const fs::path &downloads_root,
+                     std::string_view package_name,
+-                    const std::vector<int> &apk_fds, ExportSummary *summary) {
++                    const std::vector<int> &apk_fds, ExportSummary *summary,
++                    const ExportProgressSink sink, void *context) {
+   if (summary == nullptr || !IsValidPackageName(package_name) ||
+       apk_fds.empty() || apk_fds.size() > 32u) {
      return Status::kProtocolError;
    }
    *summary = ExportSummary{};
@@ -434,7 +502,7 @@ index 9d6696d..968f142 100644
    auto candidate = FindConfiguredRun(runs);
    if (!candidate.has_value()) {
      candidate = FindLatestRun(runs);
-@@ -2823,6 +3115,9 @@ Status ExportLatest(const fs::path &storage_root,
+@@ -2823,6 +3157,9 @@ Status ExportLatest(const fs::path &storage_root,
    summary->run_id = candidate->run_id;
    summary->remote_artifact_count = candidate->artifact_count;
  
@@ -444,10 +512,11 @@ index 9d6696d..968f142 100644
    std::error_code error;
    const fs::path package_output =
        downloads_root / "r0dump-exports" / std::string(package_name);
-@@ -2839,14 +3134,31 @@ Status ExportLatest(const fs::path &storage_root,
+@@ -2839,14 +3176,31 @@ Status ExportLatest(const fs::path &storage_root,
        std::to_string(
            std::chrono::steady_clock::now().time_since_epoch().count());
    const fs::path staging = package_output / unique;
+-  if (!CopyTree(candidate->path, staging, &summary->detail)) {
 +  // Reading the run directory needs the app's fsuid, and the destination has to
 +  // be writable by that same fsuid, so hand staging over first.
 +  if (scan_uid != 0 && scan_uid != geteuid()) {
@@ -457,26 +526,26 @@ index 9d6696d..968f142 100644
 +    }
 +    error.clear();
 +  }
-+  r0dump_WriteExportProgress("copying", 10);
++  r0dump_WriteExportProgress(sink, context, "copying", 10, 0u, 0u);
 +  uid_scope.enter();
-   if (!CopyTree(candidate->path, staging, &summary->detail)) {
++  if (!CopyTree(candidate->path, staging, &summary->detail, sink, context)) {
 +    uid_scope.exit();
-+    r0dump_WriteExportProgress("failed", 0);
++    r0dump_WriteExportProgress(sink, context, "failed", 0, 0u, 0u);
      fs::remove_all(staging, error);
      return Status::kRepairFailed;
    }
 +  uid_scope.exit();
-+  r0dump_WriteExportProgress("apks", 45);
++  r0dump_WriteExportProgress(sink, context, "apks", 45, 0u, 0u);
    if (!CopyApksAndManifests(apk_fds, staging, &summary->detail)) {
-+    r0dump_WriteExportProgress("failed", 0);
++    r0dump_WriteExportProgress(sink, context, "failed", 0, 0u, 0u);
      fs::remove_all(staging, error);
      return Status::kRepairFailed;
    }
-+  r0dump_WriteExportProgress("repairing", 55);
++  r0dump_WriteExportProgress(sink, context, "repairing", 55, 0u, 0u);
  
    Json::Value process_reports(Json::arrayValue);
    std::vector<fs::path> processes;
-@@ -2859,7 +3171,13 @@ Status ExportLatest(const fs::path &storage_root,
+@@ -2859,7 +3213,16 @@ Status ExportLatest(const fs::path &storage_root,
      error.clear();
    }
    std::sort(processes.begin(), processes.end());
@@ -485,13 +554,52 @@ index 9d6696d..968f142 100644
    for (const fs::path &process : processes) {
 +    // Repair re-walks every artifact; on a packed target that is the long pole
 +    // alongside archiving, so surface it.
-+    r0dump_WriteExportProgress("repairing", 55 + (repair_done * 25) / (repair_total > 0 ? repair_total : 1));
++    r0dump_WriteExportProgress(
++        sink, context, "repairing",
++        55 + (repair_done * 25) / (repair_total > 0 ? repair_total : 1),
++        static_cast<uint64_t>(repair_done), static_cast<uint64_t>(repair_total));
 +    repair_done++;
      const fs::path repair = process / "host-repair";
      const ProcessSummary result = RepairProcess(process, repair);
      summary->record_count += result.record_count;
+@@ -2913,7 +3276,8 @@ Status ExportLatest(const fs::path &storage_root,
+   unlink(temporary_zip.c_str());
+   unlink(temporary_sha.c_str());
+   if (!CreateZip(staging, temporary_zip,
+-                 std::string(package_name) + "/" + candidate->run_id)) {
++                 std::string(package_name) + "/" + candidate->run_id, sink,
++                 context)) {
+     summary->detail = "create_archive_failed";
+     fs::remove_all(staging, error);
+     return Status::kArchiveFailed;
+diff --git a/helper/r0dump_export_core.h b/helper/r0dump_export_core.h
+index da05342..bcfb71f 100644
+--- a/helper/r0dump_export_core.h
++++ b/helper/r0dump_export_core.h
+@@ -25,13 +25,20 @@ struct ExportSummary {
+   std::string detail;
+ };
+ 
++// Receives every progress update. The helper points this at the export socket
++// so the Manager sees live counters instead of one blocking call.
++using ExportProgressSink = void (*)(void *context, const char *stage, int percent,
++                                   uint64_t done, uint64_t total);
++
+ // Repairs the newest run below storage_root/Android/data/<package>/files and
+ // writes the final archive below downloads_root/r0dump-exports/<package>.
+ // apk_fds must contain base.apk first, followed by optional split APKs.
+ Status ExportLatest(const std::filesystem::path &storage_root,
+                     const std::filesystem::path &downloads_root,
+                     std::string_view package_name,
+-                    const std::vector<int> &apk_fds, ExportSummary *summary);
++                    const std::vector<int> &apk_fds, ExportSummary *summary,
++                    ExportProgressSink progress_sink = nullptr,
++                    void *progress_context = nullptr);
+ 
+ } // namespace r0dump::file_helper
+ 
 diff --git a/helper/r0dump_file_helper.cpp b/helper/r0dump_file_helper.cpp
-index 04da4d5..ffbe546 100644
+index 04da4d5..6d5f571 100644
 --- a/helper/r0dump_file_helper.cpp
 +++ b/helper/r0dump_file_helper.cpp
 @@ -25,8 +25,8 @@
@@ -505,6 +613,44 @@ index 04da4d5..ffbe546 100644
  constexpr char kPropertyPrefix[] = "persist.sys.r0dump.fusion.";
  constexpr size_t kMaxApkCount = 32u;
  
+@@ -125,6 +125,24 @@ bool SendExportResponse(int client_fd, Status status,
+          static_cast<ssize_t>(sizeof(response));
+ }
+ 
++// Progress frames are best effort: a client that stopped reading must not abort
++// an export that is already minutes into its work.
++void SendExportProgressFrame(void *context, const char *stage, int percent,
++                             uint64_t done, uint64_t total) {
++  const int client_fd =
++      static_cast<int>(reinterpret_cast<intptr_t>(context));
++  ExportProgressFrame frame = {};
++  frame.magic = kExportProgressMagic;
++  frame.version = kExportProtocolVersion;
++  frame.size = static_cast<uint16_t>(sizeof(frame));
++  frame.percent = static_cast<int32_t>(percent);
++  frame.done = done;
++  frame.total = total;
++  const size_t count = std::min(strlen(stage), sizeof(frame.stage) - 1u);
++  memcpy(frame.stage, stage, count);
++  TEMP_FAILURE_RETRY(send(client_fd, &frame, sizeof(frame), MSG_NOSIGNAL));
++}
++
+ void CloseFds(const std::vector<int> &fds) {
+   for (int fd : fds) {
+     if (fd >= 0)
+@@ -157,8 +175,10 @@ void RunExport(int client_fd, ExportRequest request, std::vector<int> apk_fds) {
+   if (ReadFixedString(request.package_name, sizeof(request.package_name),
+                       &package_name) &&
+       IsValidPackageName(package_name)) {
+-    status = ExportLatest(kStorageRoot, kDownloadsRoot, package_name, apk_fds,
+-                          &summary);
++    status = ExportLatest(
++        kStorageRoot, kDownloadsRoot, package_name, apk_fds, &summary,
++        &SendExportProgressFrame,
++        reinterpret_cast<void *>(static_cast<intptr_t>(client_fd)));
+   } else {
+     summary.detail = "invalid_package";
+   }
 diff --git a/helper/r0dump_file_helper.rc b/helper/r0dump_file_helper.rc
 index 1d91b63..4f948c7 100644
 --- a/helper/r0dump_file_helper.rc
@@ -774,6 +920,274 @@ index 657edfb..9931756 100644
      if (status != Status::kOk) {
        RemovePreparedBranch(process_directory.get(), run_directory.get(),
                             process_directory_name);
+diff --git a/helper/r0dump_file_helper_protocol.h b/helper/r0dump_file_helper_protocol.h
+index 2c642c0..1f14fca 100644
+--- a/helper/r0dump_file_helper_protocol.h
++++ b/helper/r0dump_file_helper_protocol.h
+@@ -11,6 +11,7 @@ inline constexpr uint16_t kProtocolVersion = 1u;
+ inline constexpr uint32_t kExportProtocolMagic = 0x52304558u; // R0EX
+ inline constexpr uint16_t kExportProtocolVersion = 1u;
+ inline constexpr uint32_t kExportResponseMagic = 0x52304552u; // R0ER
++inline constexpr uint32_t kExportProgressMagic = 0x52304550u; // R0EP
+ inline constexpr size_t kPackageBytes = 96u;
+ inline constexpr size_t kProcessBytes = 96u;
+ inline constexpr size_t kRunIdBytes = 65u;
+@@ -66,6 +67,19 @@ struct ExportRequest {
+   char package_name[kPackageBytes];
+ };
+ 
++// An export runs for tens of minutes on a packed target. The helper streams
++// these frames over the same SEQPACKET connection while it works, so the caller
++// only has to read until the ExportResponse arrives.
++struct ExportProgressFrame {
++  uint32_t magic;
++  uint16_t version;
++  uint16_t size;
++  int32_t percent;
++  uint64_t done;
++  uint64_t total;
++  char stage[32];
++};
++
+ struct ExportResponse {
+   uint32_t magic;
+   uint16_t version;
+@@ -89,6 +103,7 @@ static_assert(sizeof(Request) == 285u);
+ static_assert(sizeof(Response) == 12u);
+ static_assert(sizeof(ExportRequest) == 116u);
+ static_assert(sizeof(ExportResponse) == 682u);
++static_assert(sizeof(ExportProgressFrame) == 60u);
+ 
+ } // namespace r0dump::file_helper
+ 
+diff --git a/res/values-zh-rCN/strings.xml b/res/values-zh-rCN/strings.xml
+index 996debe..9a3095e 100644
+--- a/res/values-zh-rCN/strings.xml
++++ b/res/values-zh-rCN/strings.xml
+@@ -51,6 +51,13 @@
+     <string name="artifact_export_detail">由 root helper 修复最新捕获记录，并在 /sdcard/Downloads/r0dump-exports 中生成 ZIP 和 SHA-256 校验文件。</string>
+     <string name="artifact_export_action">修复并导出最新产物</string>
+     <string name="artifact_exporting">正在修复并导出…</string>
++    <string name="artifact_export_progress">%1$s · %2$d%%</string>
++    <string name="artifact_export_progress_count">%1$s · %2$d%% · %3$d / %4$d</string>
++    <string name="artifact_export_stage_copying">正在复制捕获数据</string>
++    <string name="artifact_export_stage_apks">正在复制 APK 与清单</string>
++    <string name="artifact_export_stage_repairing">正在修复 DEX 与记录</string>
++    <string name="artifact_export_stage_archiving">正在打包 ZIP</string>
++    <string name="artifact_export_stage_failed">导出失败</string>
+     <string name="artifact_export_summary">%1$d 条已验证，%2$d 条已修复，%3$d 条部分可用，已回填 %4$d 条 CodeItem，%5$d 个 JADX 可用 DEX</string>
+     <string name="artifact_export_jadx_ready">ZIP 可由 JADX 直接打开，并包含 base/split APK、提取的 Manifest 和修复证据。</string>
+     <string name="artifact_export_jadx_unavailable">未生成经过验证的 DEX；ZIP 只包含诊断证据，不能视为成功的 JADX 导出。</string>
+diff --git a/res/values/strings.xml b/res/values/strings.xml
+index 9c0d5d6..81d49c3 100644
+--- a/res/values/strings.xml
++++ b/res/values/strings.xml
+@@ -51,6 +51,13 @@
+     <string name="artifact_export_detail">Repair the newest captured run through the root helper, then create a ZIP and SHA-256 file in /sdcard/Downloads/r0dump-exports.</string>
+     <string name="artifact_export_action">Repair and export latest run</string>
+     <string name="artifact_exporting">Repairing and exporting…</string>
++    <string name="artifact_export_progress">%1$s · %2$d%%</string>
++    <string name="artifact_export_progress_count">%1$s · %2$d%% · %3$d / %4$d</string>
++    <string name="artifact_export_stage_copying">Copying captured run</string>
++    <string name="artifact_export_stage_apks">Copying APKs and manifests</string>
++    <string name="artifact_export_stage_repairing">Repairing DEX and records</string>
++    <string name="artifact_export_stage_archiving">Writing ZIP</string>
++    <string name="artifact_export_stage_failed">Export failed</string>
+     <string name="artifact_export_summary">%1$d verified, %2$d repaired, %3$d partial, %4$d CodeItems backfilled, %5$d JADX-ready DEX files</string>
+     <string name="artifact_export_jadx_ready">The ZIP can be opened directly in JADX and also includes base/split APKs, extracted manifests, and repair evidence.</string>
+     <string name="artifact_export_jadx_unavailable">No validated DEX was produced. The ZIP contains diagnostic evidence but is not a successful JADX export.</string>
+diff --git a/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt b/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt
+index 5f1cdea..294b5cb 100644
+--- a/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt
++++ b/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt
+@@ -15,6 +15,7 @@ import com.android.r0dumpmanager.data.draft.DraftStateStore
+ import com.android.r0dumpmanager.data.draft.SavedFusionDraft
+ import com.android.r0dumpmanager.data.export.ArtifactExportRepository
+ import com.android.r0dumpmanager.data.export.ArtifactExportResult
++import com.android.r0dumpmanager.data.export.ExportProgress
+ import com.android.r0dumpmanager.data.packageinfo.PackageRepository
+ import com.android.r0dumpmanager.data.packageinfo.TargetApplication
+ import com.android.r0dumpmanager.data.property.FusionDeviceSnapshot
+@@ -66,6 +67,7 @@ data class R0dumpUiState(
+     val draftNoticeSerial: Long = 0,
+     val draftNoticeShown: Boolean = false,
+     val lastExport: ArtifactExportResult? = null,
++    val exportProgress: ExportProgress? = null,
+     val mcpEnabled: Boolean = false,
+ ) {
+     val isInterrupted get() = deviceSnapshot is FusionDeviceSnapshot.Interrupted
+@@ -100,7 +102,10 @@ interface R0dumpManagerDependencies {
+     fun loadInstalledApplications(): List<TargetApplication>
+     fun launch(packageName: String): Result<Unit>
+     suspend fun forceStopAndWait(packageName: String): Result<Unit>
+-    suspend fun exportLatest(packageName: String): ArtifactExportResult
++    suspend fun exportLatest(
++        packageName: String,
++        onProgress: (ExportProgress) -> Unit = {},
++    ): ArtifactExportResult
+     fun savePersistedDraft(draft: FusionConfigDraft, generation: Long, profile: ProfileId)
+     fun restorePersistedDraft(generation: Long): SavedFusionDraft?
+     fun clearPersistedDraft()
+@@ -124,7 +129,8 @@ private class AndroidR0dumpManagerDependencies(application: Application) : R0dum
+     override fun loadInstalledApplications() = packages.loadInstalledApplications()
+     override fun launch(packageName: String) = packages.launch(packageName)
+     override suspend fun forceStopAndWait(packageName: String) = packages.forceStopAndWait(packageName)
+-    override suspend fun exportLatest(packageName: String) = exports.exportLatest(packageName)
++    override suspend fun exportLatest(packageName: String, onProgress: (ExportProgress) -> Unit) =
++        exports.exportLatest(packageName, onProgress)
+     override fun savePersistedDraft(draft: FusionConfigDraft, generation: Long, profile: ProfileId) = drafts.save(draft, generation, profile)
+     override fun restorePersistedDraft(generation: Long) = drafts.restore(generation)
+     override fun clearPersistedDraft() = drafts.clear()
+@@ -236,9 +242,20 @@ class R0dumpManagerViewModel(
+         if (!_uiState.value.isOwnerUser) return failure(text(R.string.error_owner_only))
+         if (!_uiState.value.isForeground) return failure(text(R.string.error_foreground_required))
+         if (!inFlight.compareAndSet(false, true)) return
+-        _uiState.update { it.copy(operation = MutationOperation.Exporting, lastExport = null) }
++        _uiState.update {
++            it.copy(
++                operation = MutationOperation.Exporting,
++                lastExport = null,
++                exportProgress = null,
++            )
++        }
+         viewModelScope.launch(ioDispatcher) {
+-            runCatching { dependencies.exportLatest(packageName) }.onSuccess { result ->
++            runCatching {
++                dependencies.exportLatest(packageName) { progress ->
++                    // Frames arrive from the helper thread; the Flow update is safe from any thread.
++                    _uiState.update { it.copy(exportProgress = progress) }
++                }
++            }.onSuccess { result ->
+                 dependencies.appendAudit(
+                     MutationAuditEntry(
+                         System.currentTimeMillis(),
+@@ -252,6 +269,7 @@ class R0dumpManagerViewModel(
+                     it.copy(
+                         operation = MutationOperation.Idle,
+                         lastExport = result,
++                        exportProgress = null,
+                     ).message(text(R.string.export_completed, result.archivePath))
+                 }
+             }.onFailure { error ->
+@@ -264,6 +282,7 @@ class R0dumpManagerViewModel(
+                         false,
+                     ),
+                 )
++                _uiState.update { it.copy(exportProgress = null) }
+                 failure(text(R.string.export_failed, error.message ?: error.javaClass.simpleName))
+             }
+             inFlight.set(false)
+diff --git a/src/com/android/r0dumpmanager/data/export/ArtifactExportRepository.kt b/src/com/android/r0dumpmanager/data/export/ArtifactExportRepository.kt
+index 90b7314..be8d4c8 100644
+--- a/src/com/android/r0dumpmanager/data/export/ArtifactExportRepository.kt
++++ b/src/com/android/r0dumpmanager/data/export/ArtifactExportRepository.kt
+@@ -21,33 +21,96 @@ data class ArtifactExportResult(
+     val codeItemsBackfilled: Int,
+ )
+ 
++/** Snapshot streamed by the helper while an export is running. */
++data class ExportProgress(
++    val stage: String,
++    val percent: Int,
++    val done: Long,
++    val total: Long,
++) {
++    /** 0..1 when the stage reports a denominator, otherwise null. */
++    val fraction: Float?
++        get() = if (total > 0L) (done.toDouble() / total.toDouble()).toFloat().coerceIn(0f, 1f) else null
++}
++
+ class ArtifactExportException(
+     val status: Int,
+     val detail: String,
+ ) : IOException("artifact export failed: status=$status detail=$detail")
+ 
+ class ArtifactExportRepository {
+-    fun exportLatest(packageName: String): ArtifactExportResult {
++    fun exportLatest(
++        packageName: String,
++        onProgress: (ExportProgress) -> Unit = {},
++    ): ArtifactExportResult {
+         val descriptor = ActivityManager.getService().r0dump_exportLatest(packageName)
+             ?: throw ArtifactExportException(STATUS_INTERNAL_ERROR, "request_rejected")
+-        return descriptor.use(::readResponse)
++        return descriptor.use { readResponse(it, onProgress) }
+     }
+ 
+-    private fun readResponse(descriptor: ParcelFileDescriptor): ArtifactExportResult {
+-        val bytes = ByteArray(RESPONSE_BYTES)
++    /**
++     * The helper answers on a SEQPACKET socket: one datagram per message. It
++     * streams [PROGRESS_BYTES]-sized progress frames while copying and repairs,
++     * then sends the final response, so read datagram by datagram and dispatch
++     * on the magic instead of assuming a single fixed-size blob.
++     */
++    private fun readResponse(
++        descriptor: ParcelFileDescriptor,
++        onProgress: (ExportProgress) -> Unit,
++    ): ArtifactExportResult {
++        val datagram = ByteArray(RESPONSE_BYTES)
++        var lastProgress: ExportProgress? = null
+         ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { input ->
+-            var offset = 0
+-            while (offset < bytes.size) {
+-                val read = input.read(bytes, offset, bytes.size - offset)
+-                if (read < 0) throw EOFException("short helper response")
+-                offset += read
++            while (true) {
++                val read = input.read(datagram, 0, datagram.size)
++                if (read < 0) throw EOFException("helper closed without a response")
++                if (read == PROGRESS_BYTES &&
++                    readInt(datagram, 0) == PROGRESS_MAGIC
++                ) {
++                    val progress = decodeProgress(datagram)
++                    // The helper emits on a stride; drop duplicates so the UI
++                    // does not recompose for an unchanged snapshot.
++                    if (progress != lastProgress) {
++                        lastProgress = progress
++                        onProgress(progress)
++                    }
++                    continue
++                }
++                if (read != RESPONSE_BYTES) {
++                    throw IOException("unexpected helper datagram of $read bytes")
++                }
++                return decodeResponse(datagram)
+             }
+         }
+-        return decodeResponse(bytes)
++    }
++
++    private fun readInt(bytes: ByteArray, offset: Int): Int =
++        ByteBuffer.wrap(bytes, offset, 4).order(ByteOrder.LITTLE_ENDIAN).int
++
++    private fun decodeProgress(bytes: ByteArray): ExportProgress {
++        val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
++        buffer.int
++        buffer.short
++        val size = buffer.short.toInt() and 0xffff
++        require(size == PROGRESS_BYTES) { "invalid progress frame size" }
++        val percent = buffer.int
++        val done = buffer.long
++        val total = buffer.long
++        val stage = ByteArray(STAGE_BYTES).also { buffer.get(it) }
++        val end = stage.indexOf(0)
++        return ExportProgress(
++            stage = String(stage, 0, if (end >= 0) end else stage.size, StandardCharsets.UTF_8),
++            percent = percent,
++            done = done,
++            total = total,
++        )
+     }
+ 
+     companion object {
+         private const val RESPONSE_MAGIC = 0x52304552
++        private const val PROGRESS_MAGIC = 0x52304550
++        private const val PROGRESS_BYTES = 60
++        private const val STAGE_BYTES = 32
+         private const val RESPONSE_VERSION: Short = 1
+         private const val RESPONSE_BYTES = 682
+         private const val RUN_ID_BYTES = 65
 diff --git a/src/com/android/r0dumpmanager/domain/FusionConfigValidator.kt b/src/com/android/r0dumpmanager/domain/FusionConfigValidator.kt
 index c2adf5c..9e5f6d5 100644
 --- a/src/com/android/r0dumpmanager/domain/FusionConfigValidator.kt
@@ -797,3 +1211,63 @@ index c2adf5c..9e5f6d5 100644
      const val MAX_CODE_ITEM_BYTES = 4L * 1024 * 1024
      const val MAX_FROZEN_GENERATIONS = 4L
      const val MAX_FLUSH_IDLE_MS = 60_000L
+diff --git a/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt b/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt
+index 51ffd9f..23da75c 100644
+--- a/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt
++++ b/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt
+@@ -683,6 +683,14 @@ private fun ApplicationScreen(
+     }
+ }
+ 
++private fun stageLabel(stage: String?): Int = when (stage) {
++    null, "copying" -> R.string.artifact_export_stage_copying
++    "apks" -> R.string.artifact_export_stage_apks
++    "repairing" -> R.string.artifact_export_stage_repairing
++    "archiving" -> R.string.artifact_export_stage_archiving
++    else -> R.string.artifact_export_stage_failed
++}
++
+ @Composable
+ private fun ArtifactExportSection(
+     state: R0dumpUiState,
+@@ -713,6 +721,40 @@ private fun ArtifactExportSection(
+         Spacer(Modifier.width(8.dp))
+         Text(stringResource(if (exporting) R.string.artifact_exporting else R.string.artifact_export_action))
+     }
++    // A packed export copies tens of thousands of files; a spinner alone cannot
++    // tell "working" from "hung". Show the stage and the stage-local counter.
++    if (exporting) {
++        val progress = state.exportProgress
++        val stageLabel = stringResource(stageLabel(progress?.stage))
++        Text(
++            if (progress != null && progress.total > 0L) {
++                stringResource(
++                    R.string.artifact_export_progress_count,
++                    stageLabel,
++                    progress.percent,
++                    progress.done,
++                    progress.total,
++                )
++            } else {
++                stringResource(
++                    R.string.artifact_export_progress,
++                    stageLabel,
++                    progress?.percent ?: 0,
++                )
++            },
++            style = MaterialTheme.typography.bodyMedium,
++            color = MaterialTheme.colorScheme.onSurfaceVariant,
++        )
++        val fraction = progress?.fraction
++        if (fraction != null) {
++            LinearProgressIndicator(
++                progress = { fraction },
++                modifier = Modifier.fillMaxWidth(),
++            )
++        } else {
++            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
++        }
++    }
+     state.lastExport?.let { result ->
+         Text(
+             stringResource(

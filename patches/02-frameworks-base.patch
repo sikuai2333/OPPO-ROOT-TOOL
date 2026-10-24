@@ -529,7 +529,7 @@ index 31637bf4f..77973f3eb 100644
          }
          try {
 diff --git a/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java b/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java
-index cc9cbbe58..16300c64f 100644
+index cc9cbbe58..c91d6c58c 100644
 --- a/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java
 +++ b/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java
 @@ -20,6 +20,7 @@ import android.system.Os;
@@ -540,7 +540,7 @@ index cc9cbbe58..16300c64f 100644
  import java.io.InputStream;
  import java.nio.ByteBuffer;
  import java.nio.ByteOrder;
-@@ -36,6 +37,7 @@ final class r0dump_FilePreparationBridge {
+@@ -36,10 +37,15 @@ final class r0dump_FilePreparationBridge {
    private static final int RESPONSE_BYTES = 12;
    private static final int STATUS_OK = 0;
    private static final int TIMEOUT_MS = 2000;
@@ -548,7 +548,16 @@ index cc9cbbe58..16300c64f 100644
    private static final int EXPORT_MAGIC = 0x52304558;
    private static final short EXPORT_VERSION = 1;
    private static final int EXPORT_REQUEST_BYTES = 116;
-@@ -57,6 +59,14 @@ final class r0dump_FilePreparationBridge {
+-  private static final int EXPORT_TIMEOUT_MS = 5 * 60 * 1000;
++  // The receiver blocks on this socket for the whole repair-and-archive pass.
++  // A packed target legitimately runs past 30 minutes, and the helper now
++  // streams a progress frame every few hundred files, so a real stall still
++  // surfaces well before this fires.
++  private static final int EXPORT_TIMEOUT_MS = 30 * 60 * 1000;
+   private static final int MAX_APK_COUNT = 32;
+ 
+   ParcelFileDescriptor prepare(
+@@ -57,6 +63,14 @@ final class r0dump_FilePreparationBridge {
            new LocalSocketAddress("r0dump_file_helper", LocalSocketAddress.Namespace.RESERVED));
        // LocalSocket creates its native fd lazily. Socket options are only valid after connect().
        socket.setSoTimeout(TIMEOUT_MS);
