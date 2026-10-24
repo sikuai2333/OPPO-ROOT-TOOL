@@ -1,0 +1,45 @@
+diff --git a/private/r0dump_file_helper.te b/private/r0dump_file_helper.te
+index 166eba0..bdc8c86 100644
+--- a/private/r0dump_file_helper.te
++++ b/private/r0dump_file_helper.te
+@@ -12,7 +12,7 @@ allow r0dump_file_helper self:capability { chown fowner fsetid setuid };
+ allow r0dump_file_helper self:unix_stream_socket { accept listen read write getattr getopt setopt };
+ 
+ # Traverse the per-user mount namespace before opening the FUSE-backed root.
+-allow r0dump_file_helper mnt_user_file:dir search;
++allow r0dump_file_helper mnt_user_file:dir { getattr open read search };
+ 
+ # The emulated-storage FUSE daemon performs checks against the backing
+ # media_rw data label while the helper walks and prepares app external files.
+@@ -48,7 +48,31 @@ allow system_server r0dump_file_helper:fd use;
+ # external-storage directories.
+ allow system_server fuse:dir ioctl;
+ 
++# Same O_PATH FD receipt as above, but /sdcard on hima is sdcardfs.
++allow system_server sdcardfs:dir ioctl;
++
+ # The helper owns the directory file description even after system_server
+ # duplicates it into a ParcelFileDescriptor. Only AMS can obtain and forward
+ # this descriptor; its Binder entry validates the calling app UID/PID first.
+ allow appdomain r0dump_file_helper:fd use;
++
++# hima/OP4EA7 backs /sdcard with sdcardfs instead of the FUSE daemon that
++# r0dump-fusion was written against, so the helper's traversal and directory
++# preparation have to be permitted against sdcardfs directly.
++allow r0dump_file_helper sdcardfs:dir {
++  add_name
++  create
++  getattr
++  open
++  read
++  remove_name
++  rmdir
++  search
++  setattr
++  write
++};
++allow r0dump_file_helper sdcardfs:file { create_file_perms r_file_perms };
++allow r0dump_file_helper sdcardfs:lnk_file r_file_perms;
++allow r0dump_file_helper sdcardfs:lnk_file read;
++allow r0dump_file_helper mnt_user_file:lnk_file read;
++

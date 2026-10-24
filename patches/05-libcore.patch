@@ -1,0 +1,402 @@
+diff --git a/Android.bp b/Android.bp
+index 15ef5d7a37f..139fc8f3201 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -58,6 +58,7 @@ license {
+ }
+ 
+ build = [
++
+     "JavaLibrary.bp",
+     "NativeCode.bp",
+     "Extras.bp",
+diff --git a/dalvik/src/main/java/dalvik/system/BaseDexClassLoader.java b/dalvik/src/main/java/dalvik/system/BaseDexClassLoader.java
+index 552fcc7b643..08bc307b294 100644
+--- a/dalvik/src/main/java/dalvik/system/BaseDexClassLoader.java
++++ b/dalvik/src/main/java/dalvik/system/BaseDexClassLoader.java
+@@ -58,6 +58,34 @@ public class BaseDexClassLoader extends ClassLoader {
+     @UnsupportedAppUsage
+     private final DexPathList pathList;
+ 
++    // r0dump: capture-route points observed from the Java layer.
++    static final int r0dump_POINT_BDCL_PATH_CONSTRUCTOR = 32;
++    static final int r0dump_POINT_BDCL_MEMORY_CONSTRUCTOR = 33;
++    static final int r0dump_POINT_BDCL_FIND_CLASS_SUCCESS = 34;
++
++    /** r0dump: number of dex elements on this loader's class path. */
++    static int r0dump_GetDexElementCount(ClassLoader loader) {
++        if (!(loader instanceof BaseDexClassLoader)) {
++            return 0;
++        }
++        final DexPathList list = ((BaseDexClassLoader) loader).pathList;
++        return list == null ? 0 : list.r0dump_GetDexElementCount();
++    }
++
++    /** r0dump: runtime dex cookies reachable from a class loader (no parent walk). */
++    static Object[] r0dump_GetDexCookies(ClassLoader loader) {
++        return r0dump_GetDexCookies(loader, 0);
++    }
++
++    static Object[] r0dump_GetDexCookies(ClassLoader loader, int firstElement) {
++        if (!(loader instanceof BaseDexClassLoader)) {
++            return new Object[0];
++        }
++        final DexPathList list = ((BaseDexClassLoader) loader).pathList;
++        return list == null ? new Object[0] : list.r0dump_GetDexCookies(firstElement);
++    }
++
++
+     /**
+      * Array of ClassLoaders that can be used to load classes and resources that the code in
+      * {@code pathList} may depend on. This is used to implement Android's
+@@ -158,6 +186,7 @@ public class BaseDexClassLoader extends ClassLoader {
+                 ? null
+                 : Arrays.copyOf(sharedLibraryLoaders, sharedLibraryLoaders.length);
+         this.pathList = new DexPathList(this, dexPath, librarySearchPath, null, isTrusted);
++        r0dump_Runtime.r0dump_CaptureRouteLoader(this, r0dump_POINT_BDCL_PATH_CONSTRUCTOR);
+ 
+         this.sharedLibraryLoadersAfter = sharedLibraryLoadersAfter == null
+                 ? null
+@@ -224,6 +253,7 @@ public class BaseDexClassLoader extends ClassLoader {
+         this.sharedLibraryLoadersAfter = null;
+         this.pathList = new DexPathList(this, librarySearchPath);
+         this.pathList.initByteBufferDexPath(dexFiles);
++        r0dump_Runtime.r0dump_CaptureRouteLoader(this, r0dump_POINT_BDCL_MEMORY_CONSTRUCTOR);
+         // Run background verification after having set 'pathList'.
+         this.pathList.maybeRunBackgroundVerification(this);
+     }
+@@ -244,6 +274,7 @@ public class BaseDexClassLoader extends ClassLoader {
+         List<Throwable> suppressedExceptions = new ArrayList<Throwable>();
+         Class c = pathList.findClass(name, suppressedExceptions);
+         if (c != null) {
++            r0dump_Runtime.r0dump_CaptureRouteLoader(this, r0dump_POINT_BDCL_FIND_CLASS_SUCCESS);
+             return c;
+         }
+         // Now, check whether the class is present in the "after" shared libraries.
+diff --git a/dalvik/src/main/java/dalvik/system/DexFile.java b/dalvik/src/main/java/dalvik/system/DexFile.java
+index 039767941e6..b81211eb026 100644
+--- a/dalvik/src/main/java/dalvik/system/DexFile.java
++++ b/dalvik/src/main/java/dalvik/system/DexFile.java
+@@ -57,6 +57,12 @@ public final class DexFile {
+     @ReachabilitySensitive
+     private Object mCookie;
+ 
++    /** r0dump: expose the runtime cookie so ART capture can be routed at the Java layer. */
++    Object r0dump_GetCookie() {
++        return mCookie;
++    }
++
++
+     @UnsupportedAppUsage
+     private Object mInternalCookie;
+     @UnsupportedAppUsage
+diff --git a/dalvik/src/main/java/dalvik/system/DexPathList.java b/dalvik/src/main/java/dalvik/system/DexPathList.java
+index 780f6b004b3..59e88a99ff4 100644
+--- a/dalvik/src/main/java/dalvik/system/DexPathList.java
++++ b/dalvik/src/main/java/dalvik/system/DexPathList.java
+@@ -89,6 +89,35 @@ public final class DexPathList {
+     @UnsupportedAppUsage
+     private IOException[] dexElementsSuppressedExceptions;
+ 
++    /** r0dump: number of dex elements currently held (used to bound capture walks). */
++    int r0dump_GetDexElementCount() {
++        return dexElements == null ? 0 : dexElements.length;
++    }
++
++    /** r0dump: collect runtime cookies for every dex element, from firstElement onward. */
++    Object[] r0dump_GetDexCookies() {
++        return r0dump_GetDexCookies(0);
++    }
++
++    Object[] r0dump_GetDexCookies(int firstElement) {
++        if (dexElements == null) {
++            return new Object[0];
++        }
++        final int start = Math.max(0, firstElement);
++        final java.util.ArrayList<Object> cookies = new java.util.ArrayList<>();
++        for (int index = start; index < dexElements.length; ++index) {
++            final Element element = dexElements[index];
++            if (element == null) {
++                continue;
++            }
++            final Object cookie = element.r0dump_GetDexCookie();
++            if (cookie != null) {
++                cookies.add(cookie);
++            }
++        }
++        return cookies.toArray();
++    }
++
+     private List<File> getAllNativeLibraryDirectories() {
+         List<File> allNativeLibraryDirectories = new ArrayList<>(nativeLibraryDirectories);
+         allNativeLibraryDirectories.addAll(systemNativeLibraryDirectories);
+@@ -663,6 +692,12 @@ public final class DexPathList {
+         @UnsupportedAppUsage
+         private final DexFile dexFile;
+ 
++        /** r0dump: expose this element's runtime dex cookie. */
++        Object r0dump_GetDexCookie() {
++            final DexFile file = this.dexFile;
++            return file == null ? null : file.r0dump_GetCookie();
++        }
++
+         private ClassPathURLStreamHandler urlHandler;
+         private boolean initialized;
+ 
+diff --git a/libart/src/main/java/dalvik/system/r0dump_Runtime.java b/libart/src/main/java/dalvik/system/r0dump_Runtime.java
+new file mode 100755
+index 00000000000..4b45e01b3e6
+--- /dev/null
++++ b/libart/src/main/java/dalvik/system/r0dump_Runtime.java
+@@ -0,0 +1,231 @@
++/*
++ * Copyright (C) 2026 The r0dump Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ */
++
++package dalvik.system;
++
++/**
++ * r0dump-fusion: Java bridge to the ART-integrated capture pipeline.
++ *
++ * <p>{@code art/runtime/native/dalvik_system_r0dump_Runtime.cc} registers every {@code native}
++ * method declared here. This class marshals arguments, keeps the armed capture-point mask
++ * visible to the Java-layer routing hooks in {@link BaseDexClassLoader}, and exposes the
++ * dex-cookie walk used by {@code android.app.r0dump_ClassLoaderWalk}.
++ *
++ * @hide
++ */
++public final class r0dump_Runtime {
++    private r0dump_Runtime() {}
++
++    private static java.lang.reflect.Method sGetDexCookies;
++
++    /** BaseDexClassLoader.r0dump_GetDexCookies is package-private; bind it once. */
++    private static Object[] r0dump_getDexCookies(ClassLoader loader) {
++        java.lang.reflect.Method m = sGetDexCookies;
++        if (m == null) {
++            try {
++                m = BaseDexClassLoader.class.getDeclaredMethod(
++                        "r0dump_GetDexCookies", ClassLoader.class);
++                m.setAccessible(true);
++                sGetDexCookies = m;
++            } catch (ReflectiveOperationException | RuntimeException e) {
++                return new Object[0];
++            }
++        }
++        try {
++            final Object r = m.invoke(null, loader);
++            return r instanceof Object[] ? (Object[]) r : new Object[0];
++        } catch (ReflectiveOperationException | RuntimeException e) {
++            return new Object[0];
++        }
++    }
++
++
++    /** Non-zero when at least one capture point is armed; volatile so hook sites see updates. */
++    private static volatile long r0dump_capturePointMask;
++
++    /**
++     * Configure the capture session.
++     *
++     * <p>The mask reaches {@code r0dump_capturePointMask} only after the native side accepts
++     * the configuration, so routing hooks can never fire against a rejected session.
++     */
++    public static boolean r0dump_configure(
++            int schema,
++            boolean enabled,
++            String runId,
++            String targetPackage,
++            String targetProcess,
++            String processName,
++            String outputParent,
++            int preparedDirectoryFd,
++            long capturePointMask,
++            long maxRecords,
++            long maxArtifacts,
++            long maxTotalBytes,
++            long maxDexBytes,
++            long bufferPoolBytes,
++            long maxCodeItemBytes,
++            long maxFrozenGenerations,
++            long flushIdleMs,
++            boolean manifestEnabled,
++            boolean manifestIncludeSplits,
++            long manifestMaxComponents,
++            long manifestMaxSplits,
++            long manifestMaxEventsPerSource,
++            long manifestMaxTotalEvents,
++            long manifestMaxXmlDepth,
++            long manifestMaxAttributeLength,
++            boolean walkEnabled,
++            int walkStart,
++            int walkMode,
++            String walkNamespacePrefix,
++            long walkDelayMs,
++            long walkMaxClasses,
++            long walkMaxMethods,
++            boolean forceInvokeEnabled,
++            String forceClass,
++            String forceMethod,
++            String forceMethodDescriptor,
++            long forceMaxCalls) {
++        final boolean accepted = r0dump_configureNative(
++                schema, enabled, runId, targetPackage, targetProcess, processName, outputParent,
++                preparedDirectoryFd, capturePointMask, maxRecords, maxArtifacts, maxTotalBytes,
++                maxDexBytes, bufferPoolBytes, maxCodeItemBytes, maxFrozenGenerations, flushIdleMs,
++                manifestEnabled, manifestIncludeSplits, manifestMaxComponents, manifestMaxSplits,
++                manifestMaxEventsPerSource, manifestMaxTotalEvents, manifestMaxXmlDepth,
++                manifestMaxAttributeLength, walkEnabled, walkStart, walkMode,
++                walkNamespacePrefix, walkDelayMs, walkMaxClasses, walkMaxMethods,
++                forceInvokeEnabled, forceClass, forceMethod, forceMethodDescriptor, forceMaxCalls);
++        r0dump_capturePointMask = enabled && accepted ? capturePointMask : 0L;
++        return accepted;
++    }
++
++    private static native boolean r0dump_configureNative(
++            int schema,
++            boolean enabled,
++            String runId,
++            String targetPackage,
++            String targetProcess,
++            String processName,
++            String outputParent,
++            int preparedDirectoryFd,
++            long capturePointMask,
++            long maxRecords,
++            long maxArtifacts,
++            long maxTotalBytes,
++            long maxDexBytes,
++            long bufferPoolBytes,
++            long maxCodeItemBytes,
++            long maxFrozenGenerations,
++            long flushIdleMs,
++            boolean manifestEnabled,
++            boolean manifestIncludeSplits,
++            long manifestMaxComponents,
++            long manifestMaxSplits,
++            long manifestMaxEventsPerSource,
++            long manifestMaxTotalEvents,
++            long manifestMaxXmlDepth,
++            long manifestMaxAttributeLength,
++            boolean walkEnabled,
++            int walkStart,
++            int walkMode,
++            String walkNamespacePrefix,
++            long walkDelayMs,
++            long walkMaxClasses,
++            long walkMaxMethods,
++            boolean forceInvokeEnabled,
++            String forceClass,
++            String forceMethod,
++            String forceMethodDescriptor,
++            long forceMaxCalls);
++
++    /** True when the given capture point (an {@code r0dump_Point} ordinal) is armed. */
++    static boolean r0dump_IsCapturePointActive(int point) {
++        final long mask = r0dump_capturePointMask;
++        return mask != 0L && point >= 0 && point < Long.SIZE && (mask & (1L << point)) != 0L;
++    }
++
++    /**
++     * Route a freshly created class loader through the capture pipeline.
++     *
++     * <p>A masked-out point costs one volatile read, which matters because this runs from
++     * {@code BaseDexClassLoader}'s constructors.
++     */
++    static void r0dump_CaptureRouteLoader(ClassLoader loader, int point) {
++        if (loader == null || !r0dump_IsCapturePointActive(point)) {
++            return;
++        }
++        if (!(loader instanceof BaseDexClassLoader)) {
++            return;
++        }
++        final Object[] cookies = r0dump_getDexCookies(loader);
++        for (Object cookie : cookies) {
++            r0dump_CaptureRouteCookie(cookie, point, null);
++        }
++    }
++
++    static void r0dump_CaptureRouteCookie(Object cookie, int point, String className) {
++        if (cookie == null || !r0dump_IsCapturePointActive(point)) {
++            return;
++        }
++        r0dump_CaptureRouteCookieNative(cookie, point, className);
++    }
++
++    private static native void r0dump_CaptureRouteCookieNative(
++            Object cookie, int point, String className);
++
++    /** Every class loader ART currently tracks. */
++    public static native ClassLoader[] r0dump_GetRegisteredClassLoaders();
++
++    public static native String[] r0dump_GetLoadedClassNames(ClassLoader loader);
++
++    public static native String[] r0dump_GetCookieClassNames(Object cookie);
++
++    public static native String[] r0dump_GetDexCacheClassNames(
++            ClassLoader loader, String namespacePrefix);
++
++    public static native Class<?> r0dump_FindLoadedClass(ClassLoader loader, String className);
++
++    public static native void r0dump_CaptureCookie(Object cookie, int sourceId);
++
++    public static native void r0dump_CaptureExecutable(
++            java.lang.reflect.Executable executable,
++            Object cookie,
++            String className,
++            int sourceId);
++
++    public static native boolean r0dump_ForceInvoke(
++            java.lang.reflect.Executable executable, Object receiver, String className);
++
++    public static native boolean r0dump_PublishManifestSnapshot(
++            String status,
++            String packageName,
++            String[] classNames,
++            String[] seedKinds,
++            int[] sourceOrdinals,
++            String[] sourceKinds,
++            String[] sourceStatuses,
++            int[] sourceEventCounts,
++            String[] sourceLimitHits,
++            int sourceCount,
++            int parsedSourceCount,
++            int rejectedSourceCount,
++            int xmlEventCount,
++            String limitHit);
++
++    public static native boolean r0dump_CompleteWalk(boolean bootstrapCompleted);
++
++    public static native boolean r0dump_ServiceFlush();
++
++    /** Runtime dex cookies reachable from a class loader, without walking its parents. */
++    static Object[] r0dump_GetDexCookies(ClassLoader loader) {
++        return r0dump_getDexCookies(loader);
++    }
++}
+diff --git a/non_openjdk_java_files.bp b/non_openjdk_java_files.bp
+index dba8ceca0a5..ce2aa1a8f2e 100644
+--- a/non_openjdk_java_files.bp
++++ b/non_openjdk_java_files.bp
+@@ -94,6 +94,7 @@ filegroup {
+         "libart/src/main/java/dalvik/system/VirtualThreadFrame.java",
+         "libart/src/main/java/dalvik/system/VMRuntime.java",
+         "libart/src/main/java/dalvik/system/VMStack.java",
++        "libart/src/main/java/dalvik/system/r0dump_Runtime.java",
+         "libart/src/main/java/java/lang/AndroidHardcodedSystemProperties.java",
+         "libart/src/main/java/java/lang/Daemons.java",
+         "libart/src/main/java/java/lang/DexCache.java",
+@@ -368,6 +369,7 @@ filegroup {
+         "//frameworks/base",
+     ],
+     srcs: [
++        "libart/src/main/java/dalvik/system/r0dump_Runtime.java",
+         "luni/src/main/java/java/net/AddressCache.java",
+         "luni/src/main/java/libcore/icu/CollationKeyICU.java",
+         "luni/src/main/java/libcore/internal/Java11LanguageFeatures.java",

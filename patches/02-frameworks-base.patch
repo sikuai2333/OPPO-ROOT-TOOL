@@ -1,0 +1,565 @@
+diff --git a/Android.bp b/Android.bp
+index 939c2417a..55e24c34a 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -395,6 +395,9 @@ java_defaults {
+         "unsupportedappusage",
+         // TODO(b/379770939): remove prod version of flags from other containers in framework
+         "aconfig_storage_stub",
++        // r0dump: compiled directly rather than reached through the core_platform
++        // stubs, which cannot expose dalvik.system (art's bootclasspath fragment
++        // lists "dalvik" under package_prefixes).
+     ],
+     sdk_version: "core_platform",
+     static_libs: [
+diff --git a/core/java/android/app/r0dump_Bridge.java b/core/java/android/app/r0dump_Bridge.java
+new file mode 100755
+index 000000000..97acef3e9
+--- /dev/null
++++ b/core/java/android/app/r0dump_Bridge.java
+@@ -0,0 +1,227 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package android.app;
++
++import java.lang.reflect.Method;
++
++/**
++ * r0dump: access to {@code dalvik.system.r0dump_Runtime}.
++ *
++ * <p>The class is declared with {@code @SystemApi(client = MODULE_LIBRARIES)} and
++ * registered in {@code libcore/api/module-lib-current.txt}, but frameworks/base still
++ * cannot import it at compile time: the {@code core_platform} stubs framework links
++ * against are produced from the prebuilt {@code prebuilts/module_sdk/art} snapshot,
++ * not regenerated from this tree.
++ *
++ * <p>Reflection is therefore used at compile time only. At runtime the class resolves
++ * to the real implementation on the boot classpath, and the module-lib API entry makes
++ * hiddenapi treat these members as supported rather than blocked.
++ */
++final class r0dump_Bridge {
++    private static final String CLASS = "dalvik.system.r0dump_Runtime";
++
++    private static volatile Method sConfigure;
++    private static volatile Method sGetRegisteredClassLoaders;
++    private static volatile Method sGetLoadedClassNames;
++    private static volatile Method sGetCookieClassNames;
++    private static volatile Method sGetDexCacheClassNames;
++    private static volatile Method sFindLoadedClass;
++    private static volatile Method sCaptureCookie;
++    private static volatile Method sCaptureExecutable;
++    private static volatile Method sForceInvoke;
++    private static volatile Method sPublishManifestSnapshot;
++    private static volatile Method sCompleteWalk;
++    private static volatile Method sServiceFlush;
++    private static volatile Method sGetDexCookies;
++    private static volatile boolean sProbed;
++
++    private r0dump_Bridge() {}
++
++    private static void probe() {
++        if (sProbed) {
++            return;
++        }
++        synchronized (r0dump_Bridge.class) {
++            if (sProbed) {
++                return;
++            }
++            try {
++                final Class<?> c = Class.forName(CLASS);
++                sConfigure = c.getDeclaredMethod("r0dump_configure",
++                        int.class, boolean.class, String.class, String.class,
++                        String.class, String.class, String.class, int.class,
++                        long.class, long.class, long.class, long.class, long.class,
++                        long.class, long.class, long.class, long.class, boolean.class,
++                        boolean.class, long.class, long.class, long.class, long.class,
++                        long.class, long.class, boolean.class, int.class, int.class,
++                        String.class, long.class, long.class, long.class, boolean.class,
++                        String.class, String.class, String.class, long.class);
++                sGetRegisteredClassLoaders =
++                        c.getDeclaredMethod("r0dump_GetRegisteredClassLoaders");
++                sGetLoadedClassNames =
++                        c.getDeclaredMethod("r0dump_GetLoadedClassNames", ClassLoader.class);
++                sGetCookieClassNames =
++                        c.getDeclaredMethod("r0dump_GetCookieClassNames", Object.class);
++                sGetDexCacheClassNames = c.getDeclaredMethod(
++                        "r0dump_GetDexCacheClassNames", ClassLoader.class, String.class);
++                sFindLoadedClass = c.getDeclaredMethod(
++                        "r0dump_FindLoadedClass", ClassLoader.class, String.class);
++                sCaptureCookie =
++                        c.getDeclaredMethod("r0dump_CaptureCookie", Object.class, int.class);
++                sCaptureExecutable = c.getDeclaredMethod("r0dump_CaptureExecutable",
++                        java.lang.reflect.Executable.class, Object.class,
++                        String.class, int.class);
++                sForceInvoke = c.getDeclaredMethod("r0dump_ForceInvoke",
++                        java.lang.reflect.Executable.class, Object.class, String.class);
++                sPublishManifestSnapshot = c.getDeclaredMethod(
++                        "r0dump_PublishManifestSnapshot",
++                        String.class, String.class, String[].class, String[].class,
++                        int[].class, String[].class, String[].class, int[].class,
++                        String[].class, int.class, int.class, int.class, int.class,
++                        String.class);
++                sCompleteWalk = c.getDeclaredMethod("r0dump_CompleteWalk", boolean.class);
++                sServiceFlush = c.getDeclaredMethod("r0dump_ServiceFlush");
++                sGetDexCookies = Class.forName("dalvik.system.BaseDexClassLoader")
++                        .getDeclaredMethod("r0dump_GetDexCookies", ClassLoader.class);
++            } catch (ReflectiveOperationException | RuntimeException e) {
++                // Leave the failing method null; callers degrade gracefully.
++            } finally {
++                sProbed = true;
++            }
++        }
++    }
++
++    private static Object invoke(Method m, Object... args) {
++        if (m == null) {
++            return null;
++        }
++        try {
++            m.setAccessible(true);
++            return m.invoke(null, args);
++        } catch (ReflectiveOperationException | RuntimeException e) {
++            return null;
++        }
++    }
++
++    static boolean configure(
++            int schema, boolean enabled, String runId, String targetPackage,
++            String targetProcess, String processName, String outputParent,
++            int preparedDirectoryFd, long capturePointMask, long maxRecords,
++            long maxArtifacts, long maxTotalBytes, long maxDexBytes, long bufferPoolBytes,
++            long maxCodeItemBytes, long maxFrozenGenerations, long flushIdleMs,
++            boolean manifestEnabled, boolean manifestIncludeSplits, long manifestMaxComponents,
++            long manifestMaxSplits, long manifestMaxEventsPerSource,
++            long manifestMaxTotalEvents, long manifestMaxXmlDepth,
++            long manifestMaxAttributeLength, boolean walkEnabled, int walkStart,
++            int walkMode, String walkNamespacePrefix, long walkDelayMs, long walkMaxClasses,
++            long walkMaxMethods, boolean forceInvokeEnabled, String forceClass,
++            String forceMethod, String forceMethodDescriptor, long forceMaxCalls) {
++        probe();
++        final Object r = invoke(sConfigure, schema, enabled, runId, targetPackage,
++                targetProcess, processName, outputParent, preparedDirectoryFd,
++                capturePointMask, maxRecords, maxArtifacts, maxTotalBytes, maxDexBytes,
++                bufferPoolBytes, maxCodeItemBytes, maxFrozenGenerations, flushIdleMs,
++                manifestEnabled, manifestIncludeSplits, manifestMaxComponents,
++                manifestMaxSplits, manifestMaxEventsPerSource, manifestMaxTotalEvents,
++                manifestMaxXmlDepth, manifestMaxAttributeLength, walkEnabled, walkStart,
++                walkMode, walkNamespacePrefix, walkDelayMs, walkMaxClasses, walkMaxMethods,
++                forceInvokeEnabled, forceClass, forceMethod, forceMethodDescriptor,
++                forceMaxCalls);
++        return r instanceof Boolean && (Boolean) r;
++    }
++
++    static ClassLoader[] getRegisteredClassLoaders() {
++        probe();
++        final Object r = invoke(sGetRegisteredClassLoaders);
++        return r instanceof ClassLoader[] ? (ClassLoader[]) r : new ClassLoader[0];
++    }
++
++    static String[] getLoadedClassNames(ClassLoader loader) {
++        probe();
++        final Object r = invoke(sGetLoadedClassNames, loader);
++        return r instanceof String[] ? (String[]) r : new String[0];
++    }
++
++    static String[] getCookieClassNames(Object cookie) {
++        probe();
++        final Object r = invoke(sGetCookieClassNames, cookie);
++        return r instanceof String[] ? (String[]) r : new String[0];
++    }
++
++    static String[] getDexCacheClassNames(ClassLoader loader, String namespacePrefix) {
++        probe();
++        final Object r = invoke(sGetDexCacheClassNames, loader, namespacePrefix);
++        return r instanceof String[] ? (String[]) r : new String[0];
++    }
++
++    static Class<?> findLoadedClass(ClassLoader loader, String className) {
++        probe();
++        final Object r = invoke(sFindLoadedClass, loader, className);
++        return r instanceof Class ? (Class<?>) r : null;
++    }
++
++    static void captureCookie(Object cookie, int sourceId) {
++        probe();
++        invoke(sCaptureCookie, cookie, sourceId);
++    }
++
++    static void captureExecutable(java.lang.reflect.Executable executable,
++                                  Object cookie, String className, int sourceId) {
++        probe();
++        invoke(sCaptureExecutable, executable, cookie, className, sourceId);
++    }
++
++    static boolean forceInvoke(java.lang.reflect.Executable executable,
++                               Object receiver, String className) {
++        probe();
++        final Object r = invoke(sForceInvoke, executable, receiver, className);
++        return r instanceof Boolean && (Boolean) r;
++    }
++
++    static boolean publishManifestSnapshot(String status, String packageName,
++                                           String[] classNames, String[] seedKinds,
++                                           int[] sourceOrdinals, String[] sourceKinds,
++                                           String[] sourceStatuses, int[] sourceEventCounts,
++                                           String[] sourceLimitHits, int sourceCount,
++                                           int parsedSourceCount, int rejectedSourceCount,
++                                           int xmlEventCount, String limitHit) {
++        probe();
++        final Object r = invoke(sPublishManifestSnapshot, status, packageName, classNames,
++                seedKinds, sourceOrdinals, sourceKinds, sourceStatuses, sourceEventCounts,
++                sourceLimitHits, sourceCount, parsedSourceCount, rejectedSourceCount,
++                xmlEventCount, limitHit);
++        return r instanceof Boolean && (Boolean) r;
++    }
++
++    static boolean completeWalk(boolean bootstrapCompleted) {
++        probe();
++        final Object r = invoke(sCompleteWalk, bootstrapCompleted);
++        return r instanceof Boolean && (Boolean) r;
++    }
++
++    static boolean serviceFlush() {
++        probe();
++        final Object r = invoke(sServiceFlush);
++        return r instanceof Boolean && (Boolean) r;
++    }
++
++    static Object[] getDexCookies(ClassLoader loader) {
++        probe();
++        final Object r = invoke(sGetDexCookies, loader);
++        return r instanceof Object[] ? (Object[]) r : new Object[0];
++    }
++}
+diff --git a/core/java/android/app/r0dump_ClassLoaderWalk.java b/core/java/android/app/r0dump_ClassLoaderWalk.java
+index 8f2a5ea87..ef64fda36 100644
+--- a/core/java/android/app/r0dump_ClassLoaderWalk.java
++++ b/core/java/android/app/r0dump_ClassLoaderWalk.java
+@@ -17,7 +17,6 @@
+ package android.app;
+ 
+ import android.content.pm.ApplicationInfo;
+-import dalvik.system.r0dump_Runtime;
+ import java.lang.reflect.Constructor;
+ import java.lang.reflect.Executable;
+ import java.lang.reflect.Method;
+@@ -175,7 +174,7 @@ final class r0dump_ClassLoaderWalk {
+       r0dump_addLoaderChain(applicationLoader, loaders, seenLoaders);
+       r0dump_addLoaderChain(contextLoader, loaders, seenLoaders);
+       try {
+-        final ClassLoader[] registeredLoaders = r0dump_Runtime.r0dump_GetRegisteredClassLoaders();
++        final ClassLoader[] registeredLoaders = r0dump_Bridge.getRegisteredClassLoaders();
+         if (registeredLoaders != null) {
+           for (ClassLoader loader : registeredLoaders) {
+             r0dump_addLoaderChain(loader, loaders, seenLoaders);
+@@ -202,7 +201,7 @@ final class r0dump_ClassLoaderWalk {
+             r0dump_walkNames(
+                 request.config,
+                 loader,
+-                r0dump_Runtime.r0dump_GetLoadedClassNames(loader),
++                r0dump_Bridge.getLoadedClassNames(loader),
+                 null,
+                 r0dump_SOURCE_LOADED_TABLE,
+                 state);
+@@ -252,7 +251,7 @@ final class r0dump_ClassLoaderWalk {
+               ? null
+               : source.limitHit.name();
+     }
+-    r0dump_Runtime.r0dump_PublishManifestSnapshot(
++    r0dump_Bridge.publishManifestSnapshot(
+         snapshot.status.name(),
+         snapshot.packageName,
+         classNames,
+@@ -286,7 +285,7 @@ final class r0dump_ClassLoaderWalk {
+       r0dump_FusionConfig config, ClassLoader loader, r0dump_State state) {
+     final Object[] cookies;
+     try {
+-      cookies = r0dump_Runtime.r0dump_GetDexCookies(loader);
++      cookies = r0dump_Bridge.getDexCookies(loader);
+     } catch (RuntimeException | LinkageError e) {
+       return;
+     }
+@@ -298,11 +297,11 @@ final class r0dump_ClassLoaderWalk {
+         continue;
+       }
+       try {
+-        r0dump_Runtime.r0dump_CaptureCookie(cookie, r0dump_SOURCE_COOKIE);
++        r0dump_Bridge.captureCookie(cookie, r0dump_SOURCE_COOKIE);
+         r0dump_walkNames(
+             config,
+             loader,
+-            r0dump_Runtime.r0dump_GetCookieClassNames(cookie),
++            r0dump_Bridge.getCookieClassNames(cookie),
+             cookie,
+             r0dump_SOURCE_COOKIE,
+             state);
+@@ -320,7 +319,7 @@ final class r0dump_ClassLoaderWalk {
+       r0dump_walkNames(
+           config,
+           loader,
+-          r0dump_Runtime.r0dump_GetDexCacheClassNames(loader, config.walkNamespacePrefix),
++          r0dump_Bridge.getDexCacheClassNames(loader, config.walkNamespacePrefix),
+           null,
+           r0dump_SOURCE_DEX_CACHE,
+           state);
+@@ -366,7 +365,7 @@ final class r0dump_ClassLoaderWalk {
+       try {
+         final Class<?> klass =
+             config.walkMode == r0dump_FusionConfig.WALK_MODE_LOADED_ONLY
+-                ? r0dump_Runtime.r0dump_FindLoadedClass(loader, className)
++                ? r0dump_Bridge.findLoadedClass(loader, className)
+                 : Class.forName(className, false, loader);
+         if (klass != null) {
+           r0dump_captureExecutables(klass, cookie, className, sourceId, state);
+@@ -398,7 +397,7 @@ final class r0dump_ClassLoaderWalk {
+       }
+       state.executableCount++;
+       try {
+-        r0dump_Runtime.r0dump_CaptureExecutable(method, cookie, className, sourceId);
++        r0dump_Bridge.captureExecutable(method, cookie, className, sourceId);
+       } catch (RuntimeException | LinkageError ignored) {
+       }
+     }
+@@ -408,7 +407,7 @@ final class r0dump_ClassLoaderWalk {
+       }
+       state.executableCount++;
+       try {
+-        r0dump_Runtime.r0dump_CaptureExecutable(constructor, cookie, className, sourceId);
++        r0dump_Bridge.captureExecutable(constructor, cookie, className, sourceId);
+       } catch (RuntimeException | LinkageError ignored) {
+       }
+     }
+@@ -431,7 +430,7 @@ final class r0dump_ClassLoaderWalk {
+         }
+         final Executable executable = r0dump_findForceExecutable(klass, config);
+         if (executable != null) {
+-          r0dump_Runtime.r0dump_ForceInvoke(executable, null, config.forceClass);
++          r0dump_Bridge.forceInvoke(executable, null, config.forceClass);
+           return 1;
+         }
+       } catch (ClassNotFoundException | SecurityException | LinkageError ignored) {
+@@ -468,11 +467,11 @@ final class r0dump_ClassLoaderWalk {
+         return;
+       }
+       try {
+-        final Object[] cookies = r0dump_Runtime.r0dump_GetDexCookies(loader);
++        final Object[] cookies = r0dump_Bridge.getDexCookies(loader);
+         if (cookies != null) {
+           for (Object cookie : cookies) {
+             if (cookie != null && state.r0dump_hasBudget()) {
+-              r0dump_forceNames(loader, r0dump_Runtime.r0dump_GetCookieClassNames(cookie), state);
++              r0dump_forceNames(loader, r0dump_Bridge.getCookieClassNames(cookie), state);
+             }
+           }
+         }
+@@ -482,7 +481,7 @@ final class r0dump_ClassLoaderWalk {
+         return;
+       }
+       try {
+-        r0dump_forceNames(loader, r0dump_Runtime.r0dump_GetLoadedClassNames(loader), state);
++        r0dump_forceNames(loader, r0dump_Bridge.getLoadedClassNames(loader), state);
+       } catch (RuntimeException | LinkageError ignored) {
+       }
+     }
+@@ -572,7 +571,7 @@ final class r0dump_ClassLoaderWalk {
+       }
+       state.attemptCount++;
+       try {
+-        r0dump_Runtime.r0dump_ForceInvoke(executable, null, className);
++        r0dump_Bridge.forceInvoke(executable, null, className);
+       } catch (RuntimeException | LinkageError ignored) {
+       }
+     }
+diff --git a/core/java/android/app/r0dump_FileWorker.java b/core/java/android/app/r0dump_FileWorker.java
+index 1ae383032..af26a46e5 100644
+--- a/core/java/android/app/r0dump_FileWorker.java
++++ b/core/java/android/app/r0dump_FileWorker.java
+@@ -17,7 +17,6 @@
+ package android.app;
+ 
+ import android.os.SystemClock;
+-import dalvik.system.r0dump_Runtime;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ interface r0dump_Work {
+@@ -43,9 +42,9 @@ final class r0dump_FileWorker {
+                 r0dump_waitAndServiceFlush(delayMs);
+                 r0dump_completed = work.r0dump_run();
+               } finally {
+-                boolean r0dump_due = r0dump_Runtime.r0dump_CompleteWalk(r0dump_completed);
++                boolean r0dump_due = r0dump_Bridge.completeWalk(r0dump_completed);
+                 while (r0dump_due) {
+-                  r0dump_due = r0dump_Runtime.r0dump_ServiceFlush();
++                  r0dump_due = r0dump_Bridge.serviceFlush();
+                 }
+                 r0dump_serviceFlushForever();
+               }
+@@ -63,14 +62,14 @@ final class r0dump_FileWorker {
+         SystemClock.sleep(r0dump_slice);
+         r0dump_remaining -= r0dump_slice;
+       }
+-      while (r0dump_Runtime.r0dump_ServiceFlush()) {}
++      while (r0dump_Bridge.serviceFlush()) {}
+     } while (r0dump_remaining > 0L);
+   }
+ 
+   private static void r0dump_serviceFlushForever() {
+     while (true) {
+       SystemClock.sleep(250L);
+-      while (r0dump_Runtime.r0dump_ServiceFlush()) {}
++      while (r0dump_Bridge.serviceFlush()) {}
+     }
+   }
+ }
+diff --git a/core/java/android/app/r0dump_FusionConfig.java b/core/java/android/app/r0dump_FusionConfig.java
+index c82376c15..0dee2a0f3 100644
+--- a/core/java/android/app/r0dump_FusionConfig.java
++++ b/core/java/android/app/r0dump_FusionConfig.java
+@@ -26,7 +26,6 @@ import android.os.UserHandle;
+ import android.util.JsonReader;
+ import android.util.JsonToken;
+ import android.util.Slog;
+-import dalvik.system.r0dump_Runtime;
+ import java.io.File;
+ import java.io.FileDescriptor;
+ import java.io.IOException;
+@@ -667,7 +666,7 @@ public final class r0dump_FusionConfig {
+       String processName,
+       String outputParent,
+       int preparedDirectoryFd) {
+-    return r0dump_Runtime.r0dump_configure(
++    return r0dump_Bridge.configure(
+         config.schema,
+         config.enabled,
+         config.runId,
+@@ -740,16 +739,20 @@ public final class r0dump_FusionConfig {
+     if ((capturePointMask & ~DEFINED_CAPTURE_POINT_MASK) != 0) {
+       throw r0dump_invalid("capture_point_mask");
+     }
++    // Heavily packed apps (CMB: libCmbGuard) link tens of thousands of methods
++    // before the walk finishes, so the original 4096/512 ceilings dropped the
++    // bulk of their CodeItems on active_entry_limit. The values below stay
++    // bounded but give the walk room to cover a retail app.
+     if (maxRecords == 0
+-        || maxRecords > 4096
++        || maxRecords > 262144
+         || maxArtifacts == 0
+-        || maxArtifacts > 512
++        || maxArtifacts > 16384
+         || maxArtifacts > maxRecords
+-        || maxTotalBytes > 1024L * 1024 * 1024
++        || maxTotalBytes > 2L * 1024 * 1024 * 1024
+         || maxDexBytes > 256L * 1024 * 1024
+         || maxDexBytes > maxTotalBytes
+         || bufferPoolBytes < maxDexBytes
+-        || bufferPoolBytes > 512L * 1024 * 1024
++        || bufferPoolBytes > 1024L * 1024 * 1024
+         || maxCodeItemBytes == 0
+         || maxCodeItemBytes > 4L * 1024 * 1024
+         || maxCodeItemBytes > bufferPoolBytes
+diff --git a/services/core/java/com/android/server/am/ActivityManagerService.java b/services/core/java/com/android/server/am/ActivityManagerService.java
+index 31637bf4f..77973f3eb 100644
+--- a/services/core/java/com/android/server/am/ActivityManagerService.java
++++ b/services/core/java/com/android/server/am/ActivityManagerService.java
+@@ -19340,26 +19340,46 @@ public class ActivityManagerService extends IActivityManager.Stub
+         final int callingPid = Binder.getCallingPid();
+         if (packageName == null || processName == null || runId == null
+                 || UserHandle.getUserId(callingUid) != UserHandle.USER_SYSTEM) {
++            Slog.w(TAG, "r0dump diag: bad args/user pkg=" + packageName
++                    + " proc=" + processName + " run=" + runId + " uid=" + callingUid);
+             return null;
+         }
+ 
+         synchronized (this) {
+             synchronized (mPidsSelfLocked) {
+                 final ProcessRecord process = mPidsSelfLocked.get(callingPid);
+-                if (process == null
+-                        || process.uid != callingUid
+-                        || !processName.equals(process.processName)
+-                        || !process.getPkgList().containsKey(packageName)) {
++                if (process == null) {
++                    Slog.w(TAG, "r0dump diag: no ProcessRecord for pid " + callingPid);
++                    return null;
++                }
++                if (process.uid != callingUid) {
++                    Slog.w(TAG, "r0dump diag: uid mismatch proc=" + process.uid
++                            + " caller=" + callingUid);
++                    return null;
++                }
++                if (!processName.equals(process.processName)) {
++                    Slog.w(TAG, "r0dump diag: process name mismatch asked=" + processName
++                            + " actual=" + process.processName);
++                    return null;
++                }
++                if (!process.getPkgList().containsKey(packageName)) {
++                    Slog.w(TAG, "r0dump diag: pid " + callingPid + " does not host "
++                            + packageName);
+                     return null;
+                 }
+             }
+         }
+-        if (mPackageManagerInt.getPackageUid(packageName, 0, UserHandle.USER_SYSTEM)
+-                != callingUid) {
++        final int packageUid =
++                mPackageManagerInt.getPackageUid(packageName, 0, UserHandle.USER_SYSTEM);
++        if (packageUid != callingUid) {
++            Slog.w(TAG, "r0dump diag: package uid mismatch pkgUid=" + packageUid
++                    + " caller=" + callingUid);
+             return null;
+         }
+         if (!r0dump_FusionConfig.r0dump_validateOutputPreparationForSystemServer(
+                 generation, callingUid, packageName, processName, runId)) {
++            Slog.w(TAG, "r0dump diag: validateOutputPreparation failed gen=" + generation
++                    + " pkg=" + packageName + " proc=" + processName + " run=" + runId);
+             return null;
+         }
+         try {
+diff --git a/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java b/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java
+index cc9cbbe58..16300c64f 100644
+--- a/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java
++++ b/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java
+@@ -20,6 +20,7 @@ import android.system.Os;
+ import java.io.File;
+ import java.io.FileDescriptor;
+ import java.io.IOException;
++import java.net.SocketException;
+ import java.io.InputStream;
+ import java.nio.ByteBuffer;
+ import java.nio.ByteOrder;
+@@ -36,6 +37,7 @@ final class r0dump_FilePreparationBridge {
+   private static final int RESPONSE_BYTES = 12;
+   private static final int STATUS_OK = 0;
+   private static final int TIMEOUT_MS = 2000;
++  private static final int SOCKET_BUFFER_BYTES = 64 * 1024;
+   private static final int EXPORT_MAGIC = 0x52304558;
+   private static final short EXPORT_VERSION = 1;
+   private static final int EXPORT_REQUEST_BYTES = 116;
+@@ -57,6 +59,14 @@ final class r0dump_FilePreparationBridge {
+           new LocalSocketAddress("r0dump_file_helper", LocalSocketAddress.Namespace.RESERVED));
+       // LocalSocket creates its native fd lazily. Socket options are only valid after connect().
+       socket.setSoTimeout(TIMEOUT_MS);
++      // SOCK_SEQPACKET caps a single datagram at the socket receive buffer.
++      // The default is too small once SCM_RIGHTS rides along with the response,
++      // which surfaces as EMSGSIZE ("Message too long") on some kernels.
++      try {
++        socket.setReceiveBufferSize(SOCKET_BUFFER_BYTES);
++      } catch (SocketException ignored) {
++        // Best effort; the protocol still works when the default is large enough.
++      }
+       socket.getOutputStream().write(request);
+       socket.getOutputStream().flush();
+ 

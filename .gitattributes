@@ -1,0 +1,13 @@
+# 仓库里的补丁和脚本都要保持 LF：.patch 一旦变成 CRLF，git apply 会全部失败。
+* text=auto eol=lf
+
+*.patch   text eol=lf
+*.sh      text eol=lf
+*.md      text eol=lf
+*.ps1     text eol=lf
+*.py      text eol=lf
+
+# 二进制
+*.exe     binary
+*.img     binary
+*.zip     binary

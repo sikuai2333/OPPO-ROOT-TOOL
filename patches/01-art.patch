@@ -1,0 +1,266 @@
+diff --git a/runtime/hidden_api.cc b/runtime/hidden_api.cc
+index a20eb66410..bfa9702955 100644
+--- a/runtime/hidden_api.cc
++++ b/runtime/hidden_api.cc
+@@ -96,6 +96,11 @@ static const std::vector<std::string> kCorePlatformApiExemptions = {
+     "Ldalvik/system/VMDebug;->removeApplication",
+     "Ldalvik/system/VMDebug;->setUserId",
+     "Ldalvik/system/VMDebug;->setWaitingForDebugger",
++    // r0dump-fusion: the capture bridge lives in dalvik.system (its JNI table
++    // registers that path) and is invoked reflectively from frameworks/base,
++    // because art's bootclasspath fragment lists "dalvik" under
++    // package_prefixes, so nothing added there can enter an API surface.
++    "Ldalvik/system/r0dump_Runtime;",
+     // frameworks/base/core/jni/eventlog_helper.h accesses these fields directly
+     // via JNI during initialisation (typically in the zygote).
+     "Ljava/lang/Integer;->value:I",
+diff --git a/runtime/r0dump/r0dump_buffer.cc b/runtime/r0dump/r0dump_buffer.cc
+index 5748dde30f..92c6401482 100644
+--- a/runtime/r0dump/r0dump_buffer.cc
++++ b/runtime/r0dump/r0dump_buffer.cc
+@@ -430,11 +430,16 @@ size_t r0dump_DexBlobKeyHash::operator()(const r0dump_DexBlobKey& key) const {
+          (static_cast<size_t>(key.dex_format) << 21);
+ }
+ 
++// Identity is the method and the bytes, not the observation. A packed app gets
++// the same CodeItem re-observed from several capture points and across
++// force-invoke attempts; keying on attempt_id/role made every observation a new
++// entry, which turned ~4k distinct methods into 46k records and 200k+ staged
++// files on export. Keeping the first copy preserves the bytes, and the per-record
++// metadata still records the point that produced it.
+ bool r0dump_CodeItemKey::operator==(const r0dump_CodeItemKey& other) const {
+   return dex_hash == other.dex_hash && dex_size == other.dex_size &&
+          method_index == other.method_index && code_offset == other.code_offset &&
+-         attempt_id == other.attempt_id && role == other.role && code_size == other.code_size &&
+-         code_hash == other.code_hash;
++         code_size == other.code_size && code_hash == other.code_hash;
+ }
+ 
+ size_t r0dump_CodeItemKeyHash::operator()(const r0dump_CodeItemKey& key) const {
+@@ -442,10 +447,9 @@ size_t r0dump_CodeItemKeyHash::operator()(const r0dump_CodeItemKey& key) const {
+   hash ^= key.dex_size + (hash << 6) + (hash >> 2);
+   hash ^= key.method_index + (hash << 6) + (hash >> 2);
+   hash ^= key.code_offset + (hash << 6) + (hash >> 2);
+-  hash ^= key.attempt_id + (hash << 6) + (hash >> 2);
+   hash ^= key.code_size + (hash << 6) + (hash >> 2);
+   hash ^= key.code_hash + (hash << 6) + (hash >> 2);
+-  return hash ^ std::hash<std::string>{}(key.role);
++  return hash;
+ }
+ 
+ r0dump_Staging::r0dump_Staging(std::shared_ptr<r0dump_BufferPool> pool,
+diff --git a/runtime/r0dump/r0dump_capture.cc b/runtime/r0dump/r0dump_capture.cc
+index 8f556670c2..412d9c7561 100644
+--- a/runtime/r0dump/r0dump_capture.cc
++++ b/runtime/r0dump/r0dump_capture.cc
+@@ -318,6 +318,12 @@ std::unique_ptr<uint8_t[]> r0dump_CopyLogicalData(const uint8_t* begin,
+   return copy;
+ }
+ 
++// Protected loaders (CMB's libCmbGuard among them) move a DEX's data segment out
++// of the range the DexFile still reports, so the bounded-span check rejects every
++// CodeItem even though the pointer ART hands us is perfectly live -- the method is
++// about to execute, which means the runtime must have relocated the CodeItem to
++// readable memory first. Accept that case only after proving the whole span is
++// backed by readable mappings; anything stale or unmapped still fails closed.
+ bool r0dump_GetCodeItemSpan(const DexFile& dex_file,
+                             const dex::CodeItem* code_item,
+                             size_t max_code_item_bytes,
+@@ -325,26 +331,43 @@ bool r0dump_GetCodeItemSpan(const DexFile& dex_file,
+                             size_t* size,
+                             uint32_t* code_offset) {
+   const uint8_t* item_begin = reinterpret_cast<const uint8_t*>(code_item);
+-  if (begin == nullptr || size == nullptr || code_offset == nullptr ||
+-      !r0dump_IsBoundedSpan(item_begin,
+-                            StandardDexFile::CodeItem::InsnsOffset(),
+-                            dex_file.DataBegin(),
+-                            dex_file.DataSize())) {
++  if (begin == nullptr || size == nullptr || code_offset == nullptr || item_begin == nullptr) {
+     return false;
+   }
++
++  const bool bounded_insns = r0dump_IsBoundedSpan(item_begin,
++                                                  StandardDexFile::CodeItem::InsnsOffset(),
++                                                  dex_file.DataBegin(),
++                                                  dex_file.DataSize());
++
+   const CodeItemDataAccessor accessor(dex_file, code_item);
+   const uint8_t* item_end = reinterpret_cast<const uint8_t*>(accessor.CodeItemDataEnd());
+   if (item_end <= item_begin) {
+     return false;
+   }
+   const size_t item_size = static_cast<size_t>(item_end - item_begin);
+-  if (item_size > max_code_item_bytes ||
+-      !r0dump_IsBoundedSpan(item_begin, item_size, dex_file.DataBegin(), dex_file.DataSize())) {
++  if (item_size > max_code_item_bytes) {
++    return false;
++  }
++
++  if (bounded_insns && r0dump_IsBoundedSpan(item_begin,
++                                            item_size,
++                                            dex_file.DataBegin(),
++                                            dex_file.DataSize())) {
++    *begin = item_begin;
++    *size = item_size;
++    *code_offset = static_cast<uint32_t>(item_begin - dex_file.DataBegin());
++    return true;
++  }
++
++  if (!r0dump_IsReadableSpan(item_begin, item_size)) {
+     return false;
+   }
+   *begin = item_begin;
+   *size = item_size;
+-  *code_offset = static_cast<uint32_t>(item_begin - dex_file.DataBegin());
++  // The CodeItem no longer sits inside the DexFile's reported data range, so a
++  // relative offset would be meaningless; report it as absent.
++  *code_offset = 0u;
+   return true;
+ }
+ 
+diff --git a/runtime/r0dump/r0dump_config.h b/runtime/r0dump/r0dump_config.h
+index 97c7e9bca7..a27b14ca03 100644
+--- a/runtime/r0dump/r0dump_config.h
++++ b/runtime/r0dump/r0dump_config.h
+@@ -31,12 +31,16 @@ namespace art HIDDEN {
+ 
+ inline constexpr uint32_t kR0dumpConfigSchema = 1u;
+ inline constexpr size_t kR0dumpPropertyValueBytesHardLimit = 91u;
+-inline constexpr uint32_t kR0dumpMaxRecordsHardLimit = 4096u;
+-inline constexpr uint32_t kR0dumpMaxArtifactsHardLimit = 512u;
+-inline constexpr uint64_t kR0dumpMaxTotalBytesHardLimit = 1024u * 1024u * 1024u;
++// Heavily packed apps (CMB: libCmbGuard) link tens of thousands of methods before
++// the walk completes. At the original 4096/512 ceilings the staging pool rejected
++// the bulk of their CodeItems with active_entry_limit, so the capture never saw
++// them. Raised to match the Java-side ceilings in r0dump_FusionConfig.
++inline constexpr uint32_t kR0dumpMaxRecordsHardLimit = 262144u;
++inline constexpr uint32_t kR0dumpMaxArtifactsHardLimit = 16384u;
++inline constexpr uint64_t kR0dumpMaxTotalBytesHardLimit = 2048u * 1024u * 1024u;
+ inline constexpr uint64_t kR0dumpMaxDexBytesHardLimit = 256u * 1024u * 1024u;
+ inline constexpr uint64_t kR0dumpDefaultBufferPoolBytes = 64u * 1024u * 1024u;
+-inline constexpr uint64_t kR0dumpBufferPoolBytesHardLimit = 512u * 1024u * 1024u;
++inline constexpr uint64_t kR0dumpBufferPoolBytesHardLimit = 1024u * 1024u * 1024u;
+ inline constexpr uint64_t kR0dumpMaxCodeItemBytesHardLimit = 4u * 1024u * 1024u;
+ inline constexpr uint32_t kR0dumpMaxFrozenGenerationsHardLimit = 4u;
+ inline constexpr uint32_t kR0dumpFlushIdleMsHardLimit = 60000u;
+diff --git a/runtime/r0dump/r0dump_file.cc b/runtime/r0dump/r0dump_file.cc
+index 123b7f77a9..4373274f07 100644
+--- a/runtime/r0dump/r0dump_file.cc
++++ b/runtime/r0dump/r0dump_file.cc
+@@ -16,6 +16,7 @@
+ 
+ #include "r0dump/r0dump_file.h"
+ 
++#include <sys/vfs.h>
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <inttypes.h>
+@@ -96,10 +97,33 @@ gid_t r0dump_ExpectedSharedGid() {
+ #endif
+ }
+ 
++bool r0dump_IsSdcardfsFd(int fd) {
++  struct statfs fs = {};
++  if (fstatfs(fd, &fs) != 0) {
++    return false;
++  }
++  return fs.f_type == 0x5dca2df5;  // SDCARDFS_SUPER_MAGIC
++}
++
+ bool r0dump_IsPreparedDirectory(int fd, uid_t expected_uid, gid_t expected_gid) {
+   struct stat status = {};
+-  return fstat(fd, &status) == 0 && S_ISDIR(status.st_mode) && status.st_uid == expected_uid &&
+-         status.st_gid == expected_gid && (status.st_mode & 02777) == kR0dumpDirectoryMode;
++  if (fstat(fd, &status) != 0 || !S_ISDIR(status.st_mode)) {
++    return false;
++  }
++  // hima/OP4EA7 backs /sdcard with sdcardfs rather than the FUSE daemon this
++  // design targets. sdcardfs synthesises ownership and masks the mode from its
++  // mount options, so a directory below it can never carry AID_EXT_DATA_RW /
++  // 02770 no matter what created it. The descriptor reaching here has already
++  // been validated end to end (helper ownership checks plus the uid/pid/package
++  // /generation handshake in AMS), and being a directory on that mount is the
++  // strongest property sdcardfs can express.
++  if (r0dump_IsSdcardfsFd(fd)) {
++    // Ownership and mode are synthesised by the mount, so only the uid the
++    // caller was configured for can still be checked here.
++    return status.st_uid == expected_uid;
++  }
++  return status.st_uid == expected_uid && status.st_gid == expected_gid &&
++         (status.st_mode & 02777) == kR0dumpDirectoryMode;
+ }
+ 
+ bool r0dump_SetSharedStorageMode(int fd, mode_t mode) {
+@@ -1310,6 +1334,7 @@ r0dump_GenerationWriteResult r0dump_WriteFrozenGeneration(int run_fd,
+ 
+   size_t records_written = 0u;
+   std::string methods_jsonl = state->methods_jsonl_;
++  std::string records_jsonl = state->records_jsonl_;
+   uint64_t walk_cookie_records = state->walk_cookie_records_;
+   uint64_t walk_loaded_table_records = state->walk_loaded_table_records_;
+   uint64_t walk_manifest_records = state->walk_manifest_records_;
+@@ -1329,16 +1354,11 @@ r0dump_GenerationWriteResult r0dump_WriteFrozenGeneration(int run_fd,
+       }
+       reference = &found->second;
+     }
+-    const std::string file_name = r0dump_NumberedName(record->sequence, ".json");
+-    if (file_name.empty()) {
+-      return r0dump_degrade("allocate_record_name", EOVERFLOW, artifacts_written, records_written);
+-    }
+     const std::string json = r0dump_SerializeRecord(*record, run_id, pid, reference);
+-    const r0dump_FileResult written =
+-        r0dump_WriteAtomicFile(records_directory.get(), file_name, json.data(), json.size());
+-    if (!written.ok) {
+-      return r0dump_degrade(written.operation, written.error, artifacts_written, records_written);
+-    }
++    // One file per observation cost ~265k file creations on a packed target.
++    // Accumulate instead; the export side reads jsonl and sorts by sequence.
++    records_jsonl.append(json);
++    // r0dump_SerializeRecord already ends with a newline.
+     state->last_record_sequence_ = record->sequence;
+     r0dump_LogDurableRecord(*record, reference, run_id, pid);
+     if (record->capture_kind == r0dump_CaptureKind::kCodeItem) {
+@@ -1363,6 +1383,12 @@ r0dump_GenerationWriteResult r0dump_WriteFrozenGeneration(int run_fd,
+     ++records_written;
+   }
+ 
++  const r0dump_FileResult records_write = r0dump_WriteAtomicFile(
++      records_directory.get(), "records.jsonl", records_jsonl.data(), records_jsonl.size());
++  if (!records_write.ok) {
++    return r0dump_degrade(
++        records_write.operation, records_write.error, artifacts_written, records_written);
++  }
+   const r0dump_FileResult methods_written = r0dump_WriteAtomicFile(
+       methods_directory.get(), "methods.jsonl", methods_jsonl.data(), methods_jsonl.size());
+   if (!methods_written.ok) {
+@@ -1372,6 +1398,7 @@ r0dump_GenerationWriteResult r0dump_WriteFrozenGeneration(int run_fd,
+   state->last_record_sequence_ = previous_sequence;
+   state->artifact_bytes_ = artifact_bytes;
+   state->methods_jsonl_ = std::move(methods_jsonl);
++  state->records_jsonl_ = std::move(records_jsonl);
+   state->walk_cookie_records_ = walk_cookie_records;
+   state->walk_loaded_table_records_ = walk_loaded_table_records;
+   state->walk_manifest_records_ = walk_manifest_records;
+diff --git a/runtime/r0dump/r0dump_file.h b/runtime/r0dump/r0dump_file.h
+index 97f78e7134..f3b559f6e9 100644
+--- a/runtime/r0dump/r0dump_file.h
++++ b/runtime/r0dump/r0dump_file.h
+@@ -86,6 +86,7 @@ class r0dump_WriterState final {
+   uint64_t r0dump_NextArtifactId() const { return next_artifact_id_; }
+   uint64_t r0dump_LastRecordSequence() const { return last_record_sequence_; }
+   std::string_view r0dump_MethodsJsonl() const { return methods_jsonl_; }
++  std::string_view r0dump_RecordsJsonl() const { return records_jsonl_; }
+   const std::array<uint64_t, 5u>& r0dump_ArtifactBytes() const { return artifact_bytes_; }
+   uint64_t r0dump_WalkCookieRecords() const { return walk_cookie_records_; }
+   uint64_t r0dump_WalkLoadedTableRecords() const { return walk_loaded_table_records_; }
+@@ -113,6 +114,10 @@ class r0dump_WriterState final {
+   uint64_t force_materialized_records_ = 0u;
+   uint64_t force_no_dispatch_records_ = 0u;
+   std::string methods_jsonl_;
++  // Records are appended here and written as one file per flush. Emitting one
++  // 1.2 KB file per observation cost ~265k file creations for a packed target,
++  // which dominated export time.
++  std::string records_jsonl_;
+   bool degraded_ = false;
+ };
+ 

@@ -29,3 +29,30 @@ powershell -ExecutionPolicy Bypass -File tools/query_ota.ps1 -OtaVersion PDRM00_
 ```powershell
 python tools/download_ota_multithread.py --url "<OTA_URL>" --out "_root_work/PDRM00_ota.zip" --threads 16 --md5 "<OTA_MD5>"
 ```
+
+## 3) `find-device-trees.sh`
+
+用途: 按仓库名搜索与 PDRM00 / OP4EA7 相关的 LineageOS、TWRP、内核源码树，用来确认资源还在不在、最近有没有更新。
+
+示例:
+
+```bash
+./tools/find-device-trees.sh            # 打印
+./tools/find-device-trees.sh > trees.md # 存成笔记
+```
+
+依赖: `curl`、`jq`（GitHub API 匿名限流 60 次/小时）。
+
+## 4) `../firmware/flash-scripts/flash-hima.ps1`
+
+用途: 一键刷入 boot / dtbo / vbmeta / super。
+
+示例:
+
+```powershell
+.\firmware\flash-scripts\flash-hima.ps1 -Images C:\path\to\out\target\product\hima
+.\firmware\flash-scripts\flash-hima.ps1 -Images . -SkipSuper    # 只刷 boot/dtbo/vbmeta
+```
+
+`-SkipSuper` 适合只改内核或 boot 参数的情况；改了 system 内容（含 ART）必须连 super 一起刷。
+

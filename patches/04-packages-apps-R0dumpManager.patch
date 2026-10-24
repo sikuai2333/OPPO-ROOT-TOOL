@@ -1,0 +1,799 @@
+diff --git a/helper/r0dump_export_core.cpp b/helper/r0dump_export_core.cpp
+index 9d6696d..968f142 100644
+--- a/helper/r0dump_export_core.cpp
++++ b/helper/r0dump_export_core.cpp
+@@ -1,5 +1,9 @@
+ #include "r0dump_export_core.h"
+ 
++#include <sys/fsuid.h>
++
++#include <log/log.h>
++
+ #include "r0dump_file_helper_core.h"
+ 
+ #include <fcntl.h>
+@@ -44,9 +48,13 @@ namespace fs = std::filesystem;
+ 
+ constexpr char kAlgorithmVersion[] = "r0dump-device-repair-v1";
+ constexpr size_t kDexHeaderSize = 0x70u;
+-constexpr uint64_t kMaxExportBytes = 2ull * 1024ull * 1024ull * 1024ull;
++// A packed target (CMB) yields tens of thousands of codeitem artifacts in one
++// run -- 46k on this device -- so the export staging limits have to scale with
++// the capture budget rather than the original one-DEX assumption.
++constexpr uint64_t kMaxExportBytes = 8ull * 1024ull * 1024ull * 1024ull;
+ constexpr uint64_t kMaxSingleFileBytes = 1024ull * 1024ull * 1024ull;
+-constexpr uint32_t kMaxExportFiles = 20000u;
++constexpr uint32_t kMaxExportFiles = 400000u;
++
+ constexpr uint32_t kMaxMapItems = 4096u;
+ constexpr mode_t kDirectoryMode = 02770;
+ constexpr mode_t kFileMode = 0660;
+@@ -1956,6 +1964,50 @@ std::vector<fs::path> SortedJsonRecords(const fs::path &records) {
+   return paths;
+ }
+ 
++// Records are emitted as one jsonl per flush. Read them back as (name, json)
++// pairs, ordered by the record's own sequence so the caller sees the same order
++// the legacy per-file naming produced.
++struct r0dump_LoadedRecord {
++  std::string name;
++  Json::Value value;
++};
++
++std::vector<r0dump_LoadedRecord> r0dump_LoadRecordsJsonl(const fs::path &process) {
++  std::vector<r0dump_LoadedRecord> out;
++  const fs::path jsonl = process / "records" / "records.jsonl";
++  std::ifstream input(jsonl, std::ios::binary);
++  if (!input) {
++    return out;
++  }
++  Json::CharReaderBuilder builder;
++  std::string line;
++  while (std::getline(input, line)) {
++    if (line.empty()) {
++      continue;
++    }
++    Json::CharReaderBuilder reader_builder;
++    Json::Value value;
++    std::string errors;
++    std::unique_ptr<Json::CharReader> reader(reader_builder.newCharReader());
++    if (!reader->parse(line.data(), line.data() + line.size(), &value, &errors) ||
++        !value.isObject()) {
++      // A torn final line after a crash is expected; skip it like the legacy
++      // per-file reader skipped unparsable files.
++      continue;
++    }
++    const Json::Value &seq = value["seq"];
++    std::string name;
++    if (seq.isUInt64()) {
++      char buffer[32];
++      snprintf(buffer, sizeof(buffer), "%06llu.json",
++               static_cast<unsigned long long>(seq.asUInt64()));
++      name = buffer;
++    }
++    out.push_back({std::move(name), std::move(value)});
++  }
++  return out;
++}
++
+ struct Discovered {
+   std::string name;
+   Json::Value record;
+@@ -1993,14 +2045,26 @@ ProcessSummary RepairProcess(const fs::path &process, const fs::path &output) {
+ 
+   std::vector<Discovered> discovered;
+   std::map<std::string, std::set<std::string>> method_hashes;
+-  for (const fs::path &record_path : SortedJsonRecords(process / "records")) {
+-    Json::Value record;
+-    if (!ReadJson(record_path, &record)) {
+-      continue;
++  std::vector<r0dump_LoadedRecord> loaded = r0dump_LoadRecordsJsonl(process);
++  if (loaded.empty()) {
++    // Older runs (and any run captured before the jsonl switch) still have one
++    // file per record.
++    for (const fs::path &record_path : SortedJsonRecords(process / "records")) {
++      Json::Value record;
++      if (!ReadJson(record_path, &record)) {
++        continue;
++      }
++      loaded.push_back({record_path.filename().string(), std::move(record)});
+     }
++  }
++  std::sort(loaded.begin(), loaded.end(),
++            [](const r0dump_LoadedRecord &a, const r0dump_LoadedRecord &b) {
++              return a.name < b.name;
++            });
++  for (r0dump_LoadedRecord &loaded_record : loaded) {
+     Discovered entry;
+-    entry.name = record_path.filename().string();
+-    entry.record = std::move(record);
++    entry.name = loaded_record.name;
++    entry.record = std::move(loaded_record.value);
+     entry.artifact = ArtifactPath(process, entry.record);
+     if (entry.artifact.has_value()) {
+       std::vector<uint8_t> data;
+@@ -2564,6 +2628,145 @@ std::optional<RunCandidate> FindConfiguredRun(const fs::path &runs) {
+ #endif
+ }
+ 
++// std::filesystem::copy_file goes through copy_file_range()/reflink first, and
++// sdcardfs answers that with EPERM. Stream the bytes instead so the copy works on
++// every mount this device has.
++bool r0dump_CopyStream(const fs::path &source, const fs::path &destination,
++                       mode_t mode) {
++  // Read as the app (sdcardfs only lets its owner in), then write the staging
++  // copy as ourselves: FUSE refuses a plain app uid at the top of Downloads.
++  const uid_t read_fsuid = static_cast<uid_t>(setfsuid(static_cast<uid_t>(-1)));
++  const int in = open(source.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
++  if (in < 0) {
++    return false;
++  }
++  setfsuid(geteuid());
++  const int out =
++      open(destination.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
++  if (out < 0) {
++    close(in);
++    setfsuid(read_fsuid);
++    return false;
++  }
++
++  std::array<char, 256 * 1024> buffer{};
++  bool ok = true;
++  while (ok) {
++    const ssize_t read_bytes = TEMP_FAILURE_RETRY(read(in, buffer.data(), buffer.size()));
++    if (read_bytes < 0) {
++      ok = false;
++      break;
++    }
++    if (read_bytes == 0) {
++      break;
++    }
++    ssize_t written = 0;
++    while (written < read_bytes) {
++      const ssize_t n = TEMP_FAILURE_RETRY(
++          write(out, buffer.data() + written, static_cast<size_t>(read_bytes - written)));
++      if (n <= 0) {
++        ok = false;
++        break;
++      }
++      written += n;
++    }
++  }
++
++  if (ok && fsync(out) != 0) {
++    ok = false;
++  }
++  close(out);
++  close(in);
++  setfsuid(geteuid());
++  return ok;
++}
++
++// Export runs for minutes on a packed target and the caller only sees a
++// blocking call. Publish coarse stage progress where the Manager (and adb) can
++// read it, so a long export is distinguishable from a hung one.
++void r0dump_WriteExportProgress(const char *stage, int percent) {
++  const char *path = "/storage/emulated/0/Downloads/r0dump-export-progress.json";
++  const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
++  if (fd < 0) {
++    return;
++  }
++  char buffer[128];
++  const int n = snprintf(buffer, sizeof(buffer),
++                         "{\"stage\":\"%s\",\"percent\":%d,\"pid\":%d}\n", stage,
++                         percent, getpid());
++  if (n > 0) {
++    ssize_t ignored = write(fd, buffer, static_cast<size_t>(n));
++    (void)ignored;
++  }
++  close(fd);
++}
++
++// A packed target produces one record per capture observation -- tens of
++// thousands of ~1.2 KB JSON files. Copying them individually costs minutes on
++// sdcardfs and inflates the archive, while the consumer (SortedJsonRecords)
++// only reads them in name order anyway. Fold a records/ directory into a single
++// records.jsonl so the metadata survives verbatim at a fraction of the cost.
++bool r0dump_PackRecordsJsonl(const fs::path &records_dir,
++                             const fs::path &target_file) {
++  const int out =
++      open(target_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, kFileMode);
++  if (out < 0) {
++    return false;
++  }
++  std::vector<fs::path> paths;
++  std::error_code error;
++  for (const fs::directory_entry &entry : fs::directory_iterator(records_dir, error)) {
++    if (error) {
++      break;
++    }
++    if (entry.path().extension() == ".json" && entry.is_regular_file(error) &&
++        !entry.is_symlink(error)) {
++      paths.push_back(entry.path());
++    }
++  }
++  std::sort(paths.begin(), paths.end());
++
++  bool ok = true;
++  std::array<char, 64 * 1024> buffer{};
++  for (const fs::path &path : paths) {
++    const int in = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
++    if (in < 0) {
++      ok = false;
++      break;
++    }
++    // JSON records are written without embedded newlines, so one file is one line.
++    ssize_t n = 0;
++    while ((n = TEMP_FAILURE_RETRY(read(in, buffer.data(), buffer.size()))) > 0) {
++      ssize_t written = 0;
++      while (written < n) {
++        const ssize_t w =
++            TEMP_FAILURE_RETRY(write(out, buffer.data() + written, static_cast<size_t>(n - written)));
++        if (w <= 0) {
++          ok = false;
++          break;
++        }
++        written += w;
++      }
++      if (!ok) {
++        break;
++      }
++    }
++    close(in);
++    if (!ok) {
++      break;
++    }
++    if (write(out, "\n", 1) != 1) {
++      ok = false;
++      break;
++    }
++  }
++  if (ok && fsync(out) != 0) {
++    ok = false;
++  }
++  close(out);
++  return ok;
++}
++
+ bool CopyTree(const fs::path &source, const fs::path &destination,
+               std::string *detail) {
+   std::error_code error;
+@@ -2575,12 +2778,13 @@ bool CopyTree(const fs::path &source, const fs::path &destination,
+   chmod(destination.c_str(), kDirectoryMode);
+   uint64_t total_bytes = 0u;
+   uint32_t file_count = 0u;
+-  for (const fs::directory_entry &entry :
+-       fs::recursive_directory_iterator(source, error)) {
++  for (fs::recursive_directory_iterator it(source, error), end;
++       it != end; it.increment(error)) {
+     if (error) {
+       *detail = "source_walk_failed";
+       return false;
+     }
++    const fs::directory_entry &entry = *it;
+     const fs::file_status status = entry.symlink_status(error);
+     if (error || fs::is_symlink(status)) {
+       *detail = "source_symlink_rejected";
+@@ -2593,6 +2797,25 @@ bool CopyTree(const fs::path &source, const fs::path &destination,
+     }
+     const fs::path target = destination / relative;
+     if (fs::is_directory(status)) {
++      if (entry.path().filename() == "records") {
++        // Runs captured after the jsonl switch already hold a single file;
++        // older runs still hold one file per record and get folded here.
++        const fs::path jsonl = entry.path() / "records.jsonl";
++        const fs::path packed = destination / relative.parent_path() / "records.jsonl";
++        std::error_code exists_error;
++        if (fs::is_regular_file(jsonl, exists_error)) {
++          if (!r0dump_CopyStream(jsonl, packed, kFileMode)) {
++            *detail = "copy_records_failed";
++            return false;
++          }
++        } else if (!r0dump_PackRecordsJsonl(entry.path(), packed)) {
++          *detail = "pack_records_failed";
++          return false;
++        }
++        chmod(packed.c_str(), kFileMode);
++        it.disable_recursion_pending();
++        continue;
++      }
+       fs::create_directory(target, error);
+       if (error && error != std::errc::file_exists) {
+         *detail = "create_staging_directory_failed";
+@@ -2614,9 +2837,7 @@ bool CopyTree(const fs::path &source, const fs::path &destination,
+       return false;
+     }
+     total_bytes += size;
+-    fs::copy_file(entry.path(), target, fs::copy_options::overwrite_existing,
+-                  error);
+-    if (error) {
++    if (!r0dump_CopyStream(entry.path(), target, kFileMode)) {
+       *detail = "copy_source_failed";
+       return false;
+     }
+@@ -2731,7 +2952,15 @@ bool CreateZip(const fs::path &source, const fs::path &archive,
+     }
+   }
+   std::sort(files.begin(), files.end());
++  // Archiving thousands of small files dominates the tail of an export.
++  const size_t archive_total = files.size();
++  size_t archive_done = 0;
+   for (const fs::path &path : files) {
++    if ((archive_done & 0x3f) == 0u && archive_total > 0u) {
++      r0dump_WriteExportProgress("archiving",
++                                 80 + static_cast<int>((archive_done * 20) / archive_total));
++    }
++    archive_done++;
+     const std::string name =
+         prefix + "/" + fs::relative(path, source, error).generic_string();
+     if (error || !AddFileToZip(&writer, path, name)) {
+@@ -2755,7 +2984,7 @@ bool CreateZip(const fs::path &source, const fs::path &archive,
+ 
+ std::string PublicPath(const fs::path &path) {
+   const std::string native = path.string();
+-  constexpr std::string_view root = "/mnt/user/0/emulated/0";
++  constexpr std::string_view root = "/storage/emulated/0";
+   if (native.rfind(root, 0u) == 0u) {
+     return "/sdcard" + native.substr(root.size());
+   }
+@@ -2783,12 +3012,14 @@ bool CopyApksAndManifests(const std::vector<int> &apk_fds,
+       *detail = "copy_apk_failed";
+       return false;
+     }
++    // A packed APK can hold an AndroidManifest.xml that libziparchive cannot
++    // inflate. The manifest is only an analysis aid that rides along with the
++    // capture, so a failure here must not discard the DEX we already staged.
+     if (!ExtractManifest(apk,
+                          manifest_directory /
+                              (index == 0u ? "AndroidManifest.xml"
+                                           : stem + "-AndroidManifest.xml"))) {
+-      *detail = "extract_manifest_failed";
+-      return false;
++      ALOGW("r0dump: manifest extract failed for %s, continuing", apk.c_str());
+     }
+   }
+   Json::Value index(Json::objectValue);
+@@ -2798,6 +3029,60 @@ bool CopyApksAndManifests(const std::vector<int> &apk_fds,
+   return WriteText(staging / "jadx-input.json", JsonText(index));
+ }
+ 
++// sdcardfs gates /sdcard/Android/data/<pkg> on the caller's fsuid, and the
++// helper runs as root with CAP_DAC_OVERRIDE absent, so it cannot walk an app's
++// private directory as itself. Switch to the directory's owner for the duration
++// of the scan. Ownership here comes from the filesystem, not from the request,
++// so this cannot be steered to an arbitrary uid.
++class R0dumpUidScope {
++ public:
++  explicit R0dumpUidScope(uid_t uid) : target_uid_(uid) {
++    if (uid == 0 || uid == geteuid()) {
++      return;
++    }
++    const uid_t original = static_cast<uid_t>(setfsuid(uid));
++    if (static_cast<uid_t>(setfsuid(static_cast<uid_t>(-1))) != uid) {
++      setfsuid(original);
++      return;
++    }
++    active_ = true;
++    original_ = original;
++  }
++
++  ~R0dumpUidScope() { exit(); }
++
++  // Restore the helper's own fsuid early: staging and the final archive are
++  // written under Downloads, which the target app cannot create directories in.
++  void exit() {
++    if (active_) {
++      setfsuid(original_);
++      active_ = false;
++    }
++  }
++
++  // Re-enter the app's fsuid to read its run directory again.
++  void enter() {
++    if (active_ || target_uid_ == 0) {
++      return;
++    }
++    const uid_t original = static_cast<uid_t>(setfsuid(target_uid_));
++    if (static_cast<uid_t>(setfsuid(static_cast<uid_t>(-1))) != target_uid_) {
++      setfsuid(original);
++      return;
++    }
++    active_ = true;
++    original_ = original;
++  }
++
++  R0dumpUidScope(const R0dumpUidScope &) = delete;
++  R0dumpUidScope &operator=(const R0dumpUidScope &) = delete;
++
++ private:
++  bool active_ = false;
++  uid_t original_ = 0;
++  uid_t target_uid_ = 0;
++};
++
+ } // namespace
+ 
+ Status ExportLatest(const fs::path &storage_root,
+@@ -2809,9 +3094,16 @@ Status ExportLatest(const fs::path &storage_root,
+     return Status::kProtocolError;
+   }
+   *summary = ExportSummary{};
+-  const fs::path runs = storage_root / "Android" / "data" /
+-                        std::string(package_name) / "files" / "r0dump-fusion" /
+-                        "runs";
++  const fs::path package_root =
++      storage_root / "Android" / "data" / std::string(package_name);
++  const fs::path runs = package_root / "files" / "r0dump-fusion" / "runs";
++
++  // Enter the target app's fsuid before touching anything below its directory.
++  struct stat owner_status = {};
++  const uid_t scan_uid =
++      stat(package_root.c_str(), &owner_status) == 0 ? owner_status.st_uid : 0;
++  R0dumpUidScope uid_scope(scan_uid);
++
+   auto candidate = FindConfiguredRun(runs);
+   if (!candidate.has_value()) {
+     candidate = FindLatestRun(runs);
+@@ -2823,6 +3115,9 @@ Status ExportLatest(const fs::path &storage_root,
+   summary->run_id = candidate->run_id;
+   summary->remote_artifact_count = candidate->artifact_count;
+ 
++  // Everything below writes into Downloads as the helper itself, not the app.
++  uid_scope.exit();
++
+   std::error_code error;
+   const fs::path package_output =
+       downloads_root / "r0dump-exports" / std::string(package_name);
+@@ -2839,14 +3134,31 @@ Status ExportLatest(const fs::path &storage_root,
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count());
+   const fs::path staging = package_output / unique;
++  // Reading the run directory needs the app's fsuid, and the destination has to
++  // be writable by that same fsuid, so hand staging over first.
++  if (scan_uid != 0 && scan_uid != geteuid()) {
++    fs::create_directories(staging, error);
++    if (!error) {
++      chown(staging.c_str(), scan_uid, 0);
++    }
++    error.clear();
++  }
++  r0dump_WriteExportProgress("copying", 10);
++  uid_scope.enter();
+   if (!CopyTree(candidate->path, staging, &summary->detail)) {
++    uid_scope.exit();
++    r0dump_WriteExportProgress("failed", 0);
+     fs::remove_all(staging, error);
+     return Status::kRepairFailed;
+   }
++  uid_scope.exit();
++  r0dump_WriteExportProgress("apks", 45);
+   if (!CopyApksAndManifests(apk_fds, staging, &summary->detail)) {
++    r0dump_WriteExportProgress("failed", 0);
+     fs::remove_all(staging, error);
+     return Status::kRepairFailed;
+   }
++  r0dump_WriteExportProgress("repairing", 55);
+ 
+   Json::Value process_reports(Json::arrayValue);
+   std::vector<fs::path> processes;
+@@ -2859,7 +3171,13 @@ Status ExportLatest(const fs::path &storage_root,
+     error.clear();
+   }
+   std::sort(processes.begin(), processes.end());
++  int repair_done = 0;
++  const int repair_total = static_cast<int>(processes.size());
+   for (const fs::path &process : processes) {
++    // Repair re-walks every artifact; on a packed target that is the long pole
++    // alongside archiving, so surface it.
++    r0dump_WriteExportProgress("repairing", 55 + (repair_done * 25) / (repair_total > 0 ? repair_total : 1));
++    repair_done++;
+     const fs::path repair = process / "host-repair";
+     const ProcessSummary result = RepairProcess(process, repair);
+     summary->record_count += result.record_count;
+diff --git a/helper/r0dump_file_helper.cpp b/helper/r0dump_file_helper.cpp
+index 04da4d5..ffbe546 100644
+--- a/helper/r0dump_file_helper.cpp
++++ b/helper/r0dump_file_helper.cpp
+@@ -25,8 +25,8 @@
+ namespace r0dump::file_helper {
+ namespace {
+ 
+-constexpr char kStorageRoot[] = "/mnt/user/0/emulated/0";
+-constexpr char kDownloadsRoot[] = "/mnt/user/0/emulated/0/Downloads";
++constexpr char kStorageRoot[] = "/storage/emulated/0";
++constexpr char kDownloadsRoot[] = "/storage/emulated/0/Downloads";
+ constexpr char kPropertyPrefix[] = "persist.sys.r0dump.fusion.";
+ constexpr size_t kMaxApkCount = 32u;
+ 
+diff --git a/helper/r0dump_file_helper.rc b/helper/r0dump_file_helper.rc
+index 1d91b63..4f948c7 100644
+--- a/helper/r0dump_file_helper.rc
++++ b/helper/r0dump_file_helper.rc
+@@ -1,6 +1,6 @@
+ service r0dump_file_helper /system/bin/r0dump_file_helper
+     class core
+     user root
+-    group ext_data_rw media_rw everybody
++    group ext_data_rw sdcard_r sdcard_rw media_rw everybody
+     capabilities CHOWN FOWNER FSETID SETUID
+     socket r0dump_file_helper seqpacket 0660 system system
+diff --git a/helper/r0dump_file_helper_core.cpp b/helper/r0dump_file_helper_core.cpp
+index 657edfb..9931756 100644
+--- a/helper/r0dump_file_helper_core.cpp
++++ b/helper/r0dump_file_helper_core.cpp
+@@ -1,9 +1,12 @@
+ #include "r0dump_file_helper_core.h"
+ 
++#include <log/log.h>
++
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <stdio.h>
+ #include <sys/fsuid.h>
++#include <sys/vfs.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
+ 
+@@ -15,6 +18,19 @@ namespace {
+ 
+ constexpr mode_t kDirectoryMode = 02770;
+ 
++// hima/OP4EA7 exposes /sdcard through sdcardfs rather than the FUSE daemon the
++// fusion design targets. sdcardfs synthesises ownership from its mount options
++// (fsuid/fsgid/mask), so fchown() and fchmod() on a directory below it fail with
++// EPERM no matter what the helper asks for. Ownership and mode can only be
++// verified in that case, not enforced.
++bool IsSdcardfsFd(int fd) {
++  struct statfs fs {};
++  if (fstatfs(fd, &fs) != 0)
++    return false;
++  return fs.f_type == 0x5DCA2DF5;  // SDCARDFS_SUPER_MAGIC
++}
++
++
+ class ScopedFd final {
+ public:
+   explicit ScopedFd(int fd = -1) : fd_(fd) {}
+@@ -73,6 +89,23 @@ ScopedFd OpenDirectoryPathAt(int parent_fd, std::string_view name) {
+                          O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+ }
+ 
++// sdcardfs creates entries owned by the calling fsuid, so the helper has to
++// impersonate the target app for mkdirat() as well as for openat().
++int MkdiratAsUid(int parent_fd, const char *name, mode_t mode,
++                 uid_t access_uid) {
++  const uid_t original_fsuid = static_cast<uid_t>(setfsuid(access_uid));
++  if (static_cast<uid_t>(setfsuid(static_cast<uid_t>(-1))) != access_uid) {
++    setfsuid(original_fsuid);
++    errno = EACCES;
++    return -1;
++  }
++  const int result = mkdirat(parent_fd, name, mode);
++  const int saved_errno = errno;
++  setfsuid(original_fsuid);
++  errno = saved_errno;
++  return result;
++}
++
+ ScopedFd OpenDirectoryAtAsUid(int parent_fd, std::string_view name,
+                               uid_t access_uid) {
+   ScopedFd opened = OpenDirectoryAt(parent_fd, name);
+@@ -99,10 +132,15 @@ ScopedFd OpenDirectoryAtAsUid(int parent_fd, std::string_view name,
+   return opened;
+ }
+ 
+-Status OpenExistingAt(int parent_fd, std::string_view name, ScopedFd *out) {
+-  ScopedFd opened = OpenDirectoryAt(parent_fd, name);
+-  if (opened.get() < 0)
++// sdcardfs gates /sdcard/Android/data/<pkg> on the caller's uid rather than on
++// the permission bits, so the helper has to impersonate the target app while
++// walking the tree instead of doing it as root.
++Status OpenExistingAtAsUid(int parent_fd, std::string_view name,
++                           uid_t access_uid, ScopedFd *out) {
++  ScopedFd opened = OpenDirectoryAtAsUid(parent_fd, name, access_uid);
++  if (opened.get() < 0) {
+     return StatusForErrno(errno);
++  }
+   *out = std::move(opened);
+   return Status::kOk;
+ }
+@@ -110,20 +148,27 @@ Status OpenExistingAt(int parent_fd, std::string_view name, ScopedFd *out) {
+ Status EnsureDirectoryAt(int parent_fd, std::string_view name, uid_t uid,
+                          gid_t gid, uid_t access_uid, ScopedFd *out) {
+   std::string owned(name);
+-  if (mkdirat(parent_fd, owned.c_str(), kDirectoryMode) != 0 &&
++  if (MkdiratAsUid(parent_fd, owned.c_str(), kDirectoryMode, access_uid) != 0 &&
+       errno != EEXIST) {
+     return StatusForErrno(errno);
+   }
+   ScopedFd opened = OpenDirectoryAtAsUid(parent_fd, name, access_uid);
+   if (opened.get() < 0)
+     return StatusForErrno(errno);
++  struct stat st{};
++  if (fstat(opened.get(), &st) != 0 || !S_ISDIR(st.st_mode))
++    return Status::kPermissionDenied;
++  if (IsSdcardfsFd(opened.get())) {
++    // Ownership is synthesised by the sdcardfs mount; only require that the
++    // directory is actually usable by the requesting process.
++    *out = std::move(opened);
++    return Status::kOk;
++  }
+   if (fchown(opened.get(), uid, gid) != 0 ||
+       fchmod(opened.get(), kDirectoryMode) != 0) {
+     return StatusForErrno(errno);
+   }
+-  struct stat st{};
+-  if (fstat(opened.get(), &st) != 0 || !S_ISDIR(st.st_mode) ||
+-      st.st_uid != uid || st.st_gid != gid ||
++  if (st.st_uid != uid || st.st_gid != gid ||
+       (st.st_mode & 02777) != kDirectoryMode) {
+     return Status::kPermissionDenied;
+   }
+@@ -132,19 +177,33 @@ Status EnsureDirectoryAt(int parent_fd, std::string_view name, uid_t uid,
+ }
+ 
+ Status CreateOrVerifyTrustedDirectoryAt(int parent_fd, std::string_view name,
+-                                        uid_t uid, gid_t gid, ScopedFd *out) {
++                                        uid_t uid, gid_t gid, uid_t access_uid,
++                                        ScopedFd *out) {
+   std::string owned(name);
+   bool created = false;
+-  if (mkdirat(parent_fd, owned.c_str(), kDirectoryMode) == 0) {
++  if (MkdiratAsUid(parent_fd, owned.c_str(), kDirectoryMode, access_uid) == 0) {
+     created = true;
+   } else if (errno != EEXIST) {
+     return StatusForErrno(errno);
+   }
+ 
+-  ScopedFd opened = OpenDirectoryAt(parent_fd, name);
++  ScopedFd opened = OpenDirectoryAtAsUid(parent_fd, name, access_uid);
+   if (opened.get() < 0) {
+     return StatusForErrno(errno);
+   }
++  struct stat st{};
++  if (fstat(opened.get(), &st) != 0 || !S_ISDIR(st.st_mode)) {
++    if (created) {
++      opened = ScopedFd();
++      unlinkat(parent_fd, owned.c_str(), AT_REMOVEDIR);
++    }
++    return Status::kPermissionDenied;
++  }
++  if (IsSdcardfsFd(opened.get())) {
++    // sdcardfs synthesises ownership; chown/chmod are not applicable.
++    *out = std::move(opened);
++    return Status::kOk;
++  }
+   if (created && (fchown(opened.get(), uid, gid) != 0 ||
+                   fchmod(opened.get(), kDirectoryMode) != 0)) {
+     const int saved_errno = errno;
+@@ -152,10 +211,7 @@ Status CreateOrVerifyTrustedDirectoryAt(int parent_fd, std::string_view name,
+     unlinkat(parent_fd, owned.c_str(), AT_REMOVEDIR);
+     return StatusForErrno(saved_errno);
+   }
+-
+-  struct stat st{};
+-  if (fstat(opened.get(), &st) != 0 || !S_ISDIR(st.st_mode) ||
+-      st.st_uid != uid || st.st_gid != gid ||
++  if (st.st_uid != uid || st.st_gid != gid ||
+       (st.st_mode & 02777) != kDirectoryMode) {
+     if (created) {
+       opened = ScopedFd();
+@@ -168,15 +224,27 @@ Status CreateOrVerifyTrustedDirectoryAt(int parent_fd, std::string_view name,
+ }
+ 
+ Status CreateExclusiveDirectoryAt(int parent_fd, std::string_view name,
+-                                  uid_t uid, gid_t gid, ScopedFd *out) {
++                                  uid_t uid, gid_t gid, uid_t access_uid,
++                                  ScopedFd *out) {
+   std::string owned(name);
+-  if (mkdirat(parent_fd, owned.c_str(), kDirectoryMode) != 0)
++  if (MkdiratAsUid(parent_fd, owned.c_str(), kDirectoryMode, access_uid) != 0)
+     return StatusForErrno(errno);
+-  ScopedFd opened = OpenDirectoryAt(parent_fd, name);
++  ScopedFd opened = OpenDirectoryAtAsUid(parent_fd, name, access_uid);
+   if (opened.get() < 0) {
+     unlinkat(parent_fd, owned.c_str(), AT_REMOVEDIR);
+     return StatusForErrno(errno);
+   }
++  struct stat st{};
++  if (fstat(opened.get(), &st) != 0 || !S_ISDIR(st.st_mode)) {
++    opened = ScopedFd();
++    unlinkat(parent_fd, owned.c_str(), AT_REMOVEDIR);
++    return Status::kPermissionDenied;
++  }
++  if (IsSdcardfsFd(opened.get())) {
++    // sdcardfs synthesises ownership; chown/chmod are not applicable.
++    *out = std::move(opened);
++    return Status::kOk;
++  }
+   if (fchown(opened.get(), uid, gid) != 0 ||
+       fchmod(opened.get(), kDirectoryMode) != 0) {
+     const int saved_errno = errno;
+@@ -184,9 +252,7 @@ Status CreateExclusiveDirectoryAt(int parent_fd, std::string_view name,
+     unlinkat(parent_fd, owned.c_str(), AT_REMOVEDIR);
+     return StatusForErrno(saved_errno);
+   }
+-  struct stat st{};
+-  if (fstat(opened.get(), &st) != 0 || !S_ISDIR(st.st_mode) ||
+-      st.st_uid != uid || st.st_gid != gid ||
++  if (st.st_uid != uid || st.st_gid != gid ||
+       (st.st_mode & 02777) != kDirectoryMode) {
+     opened = ScopedFd();
+     unlinkat(parent_fd, owned.c_str(), AT_REMOVEDIR);
+@@ -290,17 +356,21 @@ Status PrepareDirectoryTreeAt(int root_fd, const Request &request,
+   ScopedFd data_directory;
+   ScopedFd package_directory;
+   ScopedFd files_directory;
+-  Status status = OpenExistingAt(root_fd, "Android", &android_directory);
++  Status status =
++      OpenExistingAtAsUid(root_fd, "Android", ownership.process_uid,
++                          &android_directory);
+   if (status != Status::kOk)
+     return status;
+-  status = OpenExistingAt(android_directory.get(), "data", &data_directory);
++  status = OpenExistingAtAsUid(android_directory.get(), "data",
++                               ownership.process_uid, &data_directory);
+   if (status != Status::kOk)
+     return status;
+-  status =
+-      OpenExistingAt(data_directory.get(), package_name, &package_directory);
++  status = OpenExistingAtAsUid(data_directory.get(), package_name,
++                               ownership.process_uid, &package_directory);
+   if (status != Status::kOk)
+     return status;
+-  status = OpenExistingAt(package_directory.get(), "files", &files_directory);
++  status = OpenExistingAtAsUid(package_directory.get(), "files",
++                               ownership.process_uid, &files_directory);
+   if (status != Status::kOk)
+     return status;
+ 
+@@ -320,7 +390,7 @@ Status PrepareDirectoryTreeAt(int root_fd, const Request &request,
+     return status;
+   status = CreateOrVerifyTrustedDirectoryAt(
+       runs_directory.get(), run_id, ownership.shared_uid, ownership.gid,
+-      &run_directory);
++      ownership.process_uid, &run_directory);
+   if (status != Status::kOk)
+     return status;
+ 
+@@ -335,7 +405,7 @@ Status PrepareDirectoryTreeAt(int root_fd, const Request &request,
+   ScopedFd process_directory;
+   status = CreateExclusiveDirectoryAt(
+       run_directory.get(), process_directory_name, ownership.process_uid,
+-      ownership.gid, &process_directory);
++      ownership.gid, ownership.process_uid, &process_directory);
+   if (status != Status::kOk)
+     return status;
+ 
+@@ -345,7 +415,7 @@ Status PrepareDirectoryTreeAt(int root_fd, const Request &request,
+     ScopedFd ignored;
+     status = CreateExclusiveDirectoryAt(process_directory.get(), directory,
+                                         ownership.process_uid, ownership.gid,
+-                                        &ignored);
++                                        ownership.process_uid, &ignored);
+     if (status != Status::kOk) {
+       RemovePreparedBranch(process_directory.get(), run_directory.get(),
+                            process_directory_name);
+diff --git a/src/com/android/r0dumpmanager/domain/FusionConfigValidator.kt b/src/com/android/r0dumpmanager/domain/FusionConfigValidator.kt
+index c2adf5c..9e5f6d5 100644
+--- a/src/com/android/r0dumpmanager/domain/FusionConfigValidator.kt
++++ b/src/com/android/r0dumpmanager/domain/FusionConfigValidator.kt
+@@ -33,11 +33,14 @@ data class FusionValidationResult(val errors: Map<String, FusionValidationError>
+ }
+ 
+ object FusionConfigValidator {
+-    const val MAX_RECORDS = 4096L
+-    const val MAX_ARTIFACTS = 512L
+-    const val MAX_TOTAL_BYTES = 1024L * 1024 * 1024
++    // Packed apps (CMB: libCmbGuard) link tens of thousands of methods before the
++    // walk completes; the original 4096/512 ceilings dropped most of their
++    // CodeItems with active_entry_limit. Keep the same shape, raise the limits.
++    const val MAX_RECORDS = 262144L
++    const val MAX_ARTIFACTS = 16384L
++    const val MAX_TOTAL_BYTES = 2L * 1024 * 1024 * 1024
+     const val MAX_DEX_BYTES = 256L * 1024 * 1024
+-    const val MAX_BUFFER_POOL_BYTES = 512L * 1024 * 1024
++    const val MAX_BUFFER_POOL_BYTES = 1024L * 1024 * 1024
+     const val MAX_CODE_ITEM_BYTES = 4L * 1024 * 1024
+     const val MAX_FROZEN_GENERATIONS = 4L
+     const val MAX_FLUSH_IDLE_MS = 60_000L
