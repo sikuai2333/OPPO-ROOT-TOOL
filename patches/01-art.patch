@@ -14,6 +14,94 @@ index a20eb66410..bfa9702955 100644
      // frameworks/base/core/jni/eventlog_helper.h accesses these fields directly
      // via JNI during initialisation (typically in the zygote).
      "Ljava/lang/Integer;->value:I",
+diff --git a/runtime/jni/jni_internal.cc b/runtime/jni/jni_internal.cc
+index e386e6d7a3..b7b6284784 100644
+--- a/runtime/jni/jni_internal.cc
++++ b/runtime/jni/jni_internal.cc
+@@ -19,6 +19,7 @@
+ #include <log/log.h>
+ 
+ #include <cstdarg>
++#include <dlfcn.h>
+ #include <memory>
+ #include <utility>
+ 
+@@ -45,6 +46,7 @@
+ #include "hidden_api.h"
+ #include "indirect_reference_table-inl.h"
+ #include "instrumentation.h"
++#include "r0dump/r0dump_log.h"
+ #include "interpreter/interpreter.h"
+ #include "java_vm_ext.h"
+ #include "jni_env_ext.h"
+@@ -2635,6 +2637,45 @@ class JNI {
+                                                                      buf);
+   }
+ 
++  // Records which shared object backs a dynamically registered native method.
++  // Every packer that moves Java code into native form has to come through
++  // RegisterNatives, so this hook is packer-agnostic. The record carries the
++  // owning module and the RVA, which is what a reverse engineer needs to open
++  // the right function in a disassembler.
++  static void r0dump_LogNativeBinding(Handle<mirror::Class> klass,
++                                      const char* name,
++                                      const char* signature,
++                                      const void* fn_ptr)
++      REQUIRES_SHARED(Locks::mutator_lock_) {
++    if (fn_ptr == nullptr) {
++      return;
++    }
++    Dl_info info{};
++    const char* module = "(unknown)";
++    uintptr_t base = 0u;
++    uintptr_t rva = 0u;
++    if (dladdr(fn_ptr, &info) != 0 && info.dli_fname != nullptr) {
++      module = info.dli_fname;
++      base = reinterpret_cast<uintptr_t>(info.dli_fbase);
++      rva = reinterpret_cast<uintptr_t>(fn_ptr) - base;
++    }
++    char rva_text[32];
++    snprintf(rva_text, sizeof(rva_text), "0x%" PRIxPTR, rva);
++    char address_text[32];
++    snprintf(address_text, sizeof(address_text), "0x%" PRIxPTR,
++             reinterpret_cast<uintptr_t>(fn_ptr));
++    const std::string class_name = klass->PrettyDescriptor();
++    r0dump_Log(r0dump_LogLevel::kInfo,
++               "native_binding",
++               {{"site", "JNI.RegisterNatives"},
++                {"class", class_name},
++                {"method", name},
++                {"signature", signature},
++                {"module", module},
++                {"module_base", address_text},
++                {"rva", rva_text}});
++  }
++
+   static jint RegisterNatives(JNIEnv* env,
+                               jclass java_class,
+                               const JNINativeMethod* methods,
+@@ -2791,6 +2832,9 @@ class JNI {
+       }
+       const void* final_function_ptr = class_linker->RegisterNative(soa.Self(), m, fnPtr);
+       UNUSED(final_function_ptr);
++      r0dump_LogNativeBinding(c, name, sig, final_function_ptr != nullptr
++                                                  ? final_function_ptr
++                                                  : fnPtr);
+     }
+     return JNI_OK;
+   }
+diff --git a/runtime/native/dalvik_system_r0dump_Runtime.cc b/runtime/native/dalvik_system_r0dump_Runtime.cc
+index dbb411dc5e..0fa033891a 100644
+--- a/runtime/native/dalvik_system_r0dump_Runtime.cc
++++ b/runtime/native/dalvik_system_r0dump_Runtime.cc
+@@ -16,6 +16,7 @@
+ 
+ #include "dalvik_system_r0dump_Runtime.h"
+ 
++#include <dlfcn.h>
+ #include <fcntl.h>
+ #include <unistd.h>
+ 
 diff --git a/runtime/r0dump/r0dump_buffer.cc b/runtime/r0dump/r0dump_buffer.cc
 index 5748dde30f..92c6401482 100644
 --- a/runtime/r0dump/r0dump_buffer.cc
@@ -264,3 +352,16 @@ index 97f78e7134..f3b559f6e9 100644
    bool degraded_ = false;
  };
  
+diff --git a/runtime/r0dump/r0dump_log.cc b/runtime/r0dump/r0dump_log.cc
+index 34538a2315..16d32c7461 100644
+--- a/runtime/r0dump/r0dump_log.cc
++++ b/runtime/r0dump/r0dump_log.cc
+@@ -29,7 +29,7 @@ namespace {
+ 
+ constexpr char kR0dumpLogTag[] = "R0dumpFusion";
+ constexpr uint64_t kRateWindowNs = UINT64_C(1000000000);
+-constexpr size_t kRecordsPerWindow = 10;
++constexpr size_t kRecordsPerWindow = 4096;
+ 
+ struct r0dump_RateKey {
+   std::string event;

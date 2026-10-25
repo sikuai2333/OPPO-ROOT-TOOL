@@ -14,7 +14,7 @@ index 939c2417a..55e24c34a 100644
      static_libs: [
 diff --git a/core/java/android/app/r0dump_Bridge.java b/core/java/android/app/r0dump_Bridge.java
 new file mode 100755
-index 000000000..97acef3e9
+index 000000000..ae8e1f938
 --- /dev/null
 +++ b/core/java/android/app/r0dump_Bridge.java
 @@ -0,0 +1,227 @@

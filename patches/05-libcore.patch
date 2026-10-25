@@ -145,10 +145,10 @@ index 780f6b004b3..59e88a99ff4 100644
  
 diff --git a/libart/src/main/java/dalvik/system/r0dump_Runtime.java b/libart/src/main/java/dalvik/system/r0dump_Runtime.java
 new file mode 100755
-index 00000000000..4b45e01b3e6
+index 00000000000..4e27881de8d
 --- /dev/null
 +++ b/libart/src/main/java/dalvik/system/r0dump_Runtime.java
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,232 @@
 +/*
 + * Copyright (C) 2026 The r0dump Project
 + *
@@ -375,6 +375,7 @@ index 00000000000..4b45e01b3e6
 +
 +    public static native boolean r0dump_ServiceFlush();
 +
++    
 +    /** Runtime dex cookies reachable from a class loader, without walking its parents. */
 +    static Object[] r0dump_GetDexCookies(ClassLoader loader) {
 +        return r0dump_getDexCookies(loader);

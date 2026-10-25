@@ -317,3 +317,66 @@ adb shell "r0dump_mcp_bridge < /data/local/tmp/req.jsonl"
 - ART 是 **preload apex**（首阶段从 `/dev/block/dm-*` 挂载），`adb remount` 改 `/system/apex/com.android.art.capex` 不生效，必须整包刷 `super`。
 
 参考：[tiwe0/r0dump](https://github.com/tiwe0/r0dump)
+
+## 13. 2026-10-25 追加：360（libjiagu）实测结论
+
+### 13.1 DEX 是完整的，缺的是方法体
+
+对 `com.mubu.app`（360 加固，`assets/libjiagu_a64.so`）的捕获结果：
+
+```text
+DEX files (deduped): 18
+methods: 332707   coded: 306299 (92.06%)   native: 3885 (1.17%)   empty: 0 (0.0%)
+structural: OK
+```
+
+`empty: 0` 说明没有 NOP 空桩，所有 header 与 Adler32 校验通过。**问题不在 DEX 完整性**。
+
+### 13.2 入口类是真的被改成了 native
+
+```text
+MubuSplashActivity: 51 methods
+  onCreate  kind=virtual  access=0x0104  code_off=0  native=True
+```
+
+`0x0104` = `ACC_PROTECTED | ACC_NATIVE`。方法声明在，但没有 `code_off`。
+
+> **解析陷阱**：`class_data_item` 里 direct_methods 和 virtual_methods 是**两个独立列表，各自从 0 开始做增量编码**。当成连续序列累加会得到完全错误的方法名，进而误判成「方法被剥离」。
+
+### 13.3 360 不走 RegisterNatives
+
+在 ART 的 `RegisterNatives` 里加钩子（`jni_internal.cc`），用 `dladdr` 反查模块和 RVA。放开日志限流（10 → 4096/秒）后单次冷启动共 **3,969 条**注册记录：
+
+```text
+2131  /system/lib64/libandroid_runtime.so
+ 862  /system/lib64/libhwui.so
+ 427  /apex/com.android.art/lib64/libart.so
+ 273  libopenjdk.so
+  12  /data/data/com.mubu.app/.jiagu/libjiagu_64.so   ← 全部是 com.stub.StubApp.interfaceN
+```
+
+**没有任何业务类。** `MubuSplashActivity.onCreate` 一次都没出现。结论：360 绕过 JNI 层，直接写 `ArtMethod.data_`。
+
+### 13.4 遍历 ArtMethod 的方案会崩
+
+尝试遍历类表、对每个 native 方法 `dladdr(GetEntryPointFromJni())`，结果：
+
+```text
+Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x8
+```
+
+`ClassLinker::VisitClasses` 与 `Class::GetMethods` 之间存在竞态，会撞到无效的 ArtMethod 槽位。**该方案已回退，未包含在补丁中。**
+
+### 13.5 能做到与做不到
+
+| 能力 | 状态 |
+|---|---|
+| DEX 完整性审计 | ✅ `tools/unpackfix/audit.py` |
+| 抽取方法识别（含置信度） | ✅ 46 高置信 + 5 低置信 |
+| 壳特征识别与清理 | ✅ 71 个类 + 2 个 so |
+| 入口 Application 还原 | ✅ `tools/unpackfix/repack.py` |
+| native → so+RVA（走 RegisterNatives 的壳） | ✅ ART 钩子可用 |
+| native → so+RVA（直接写 ArtMethod 的壳，如 360） | ❌ 需要换落点 |
+| 方法体还原成 Java | ❌ 无通用解 |
+
+**「自动回填成可运行 APK」的瓶颈不在回填，在过签。** 现代壳的签名校验几乎全在 native，只能逐样本手工定位；而壳清理 + 入口还原 + DEX 审计这三项是可以全自动的。

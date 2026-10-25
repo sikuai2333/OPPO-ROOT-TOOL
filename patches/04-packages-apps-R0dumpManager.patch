@@ -1,5 +1,5 @@
 diff --git a/helper/r0dump_export_core.cpp b/helper/r0dump_export_core.cpp
-index 9d6696d..b1002d8 100644
+index 9d6696d..37c3ccd 100644
 --- a/helper/r0dump_export_core.cpp
 +++ b/helper/r0dump_export_core.cpp
 @@ -1,5 +1,9 @@
@@ -31,7 +31,67 @@ index 9d6696d..b1002d8 100644
  constexpr uint32_t kMaxMapItems = 4096u;
  constexpr mode_t kDirectoryMode = 02770;
  constexpr mode_t kFileMode = 0660;
-@@ -1956,6 +1965,56 @@ std::vector<fs::path> SortedJsonRecords(const fs::path &records) {
+@@ -81,6 +90,9 @@ struct DexCandidate {
+   std::string relative_artifact;
+   std::string digest;
+   MethodCatalog catalog;
++  // Runtime identity of the DexFile this blob was captured from. method_index is
++  // only unique inside one DEX, so pin the owner when the record names it.
++  uint64_t dex_object_id = 0u;
+ };
+ 
+ struct ProcessSummary {
+@@ -1789,28 +1801,39 @@ std::string NormalizeClassName(const std::string &value) {
+ }
+ 
+ std::optional<uint32_t> MatchCodeItem(const Json::Value &record,
+-                                      const MethodCatalog &catalog) {
++                                      const MethodCatalog &catalog,
++                                      uint64_t candidate_dex_id) {
+   if (!record["method_index"].isUInt()) {
+     return std::nullopt;
+   }
++  // NOTE: dex_object_id is not comparable across record kinds -- the DEX record
++  // and the CodeItem record for the same DexFile carry different values, so
++  // filtering on it rejects every fragment. Disambiguation falls back to the
++  // method catalog contents below.
++  static_cast<void>(candidate_dex_id);
+   const uint32_t method_index = record["method_index"].asUInt();
+   const auto candidate = catalog.find(method_index);
+-  if (candidate == catalog.end() || !record["class_name"].isString() ||
+-      !record["method_name"].isString() ||
+-      !record["method_descriptor"].isString()) {
++  if (candidate == catalog.end()) {
+     return std::nullopt;
+   }
+   const MethodInfo &method = candidate->second;
+-  if (NormalizeClassName(record["class_name"].asString()) !=
+-          method.class_name ||
+-      record["method_name"].asString() != method.method_name ||
+-      record["method_descriptor"].asString() != method.descriptor) {
+-    return std::nullopt;
+-  }
++  // method_index is only unique inside one DEX, so pin the owning class when the
++  // capture carried it. Recent captures leave the name fields null and only
++  // report indices, which used to reject every fragment as "target_dex_not_found".
+   if (record["class_def_index"].isUInt() &&
+       record["class_def_index"].asUInt() != method.class_def_index) {
+     return std::nullopt;
+   }
++  const bool has_names = record["class_name"].isString() &&
++                         record["method_name"].isString() &&
++                         record["method_descriptor"].isString();
++  if (has_names) {
++    if (NormalizeClassName(record["class_name"].asString()) != method.class_name ||
++        record["method_name"].asString() != method.method_name ||
++        record["method_descriptor"].asString() != method.descriptor) {
++      return std::nullopt;
++    }
++  }
+   return method.code_off;
+ }
+ 
+@@ -1956,6 +1979,56 @@ std::vector<fs::path> SortedJsonRecords(const fs::path &records) {
    return paths;
  }
  
@@ -88,7 +148,7 @@ index 9d6696d..b1002d8 100644
  struct Discovered {
    std::string name;
    Json::Value record;
-@@ -1993,14 +2052,26 @@ ProcessSummary RepairProcess(const fs::path &process, const fs::path &output) {
+@@ -1993,14 +2066,26 @@ ProcessSummary RepairProcess(const fs::path &process, const fs::path &output) {
  
    std::vector<Discovered> discovered;
    std::map<std::string, std::set<std::string>> method_hashes;
@@ -121,7 +181,34 @@ index 9d6696d..b1002d8 100644
      entry.artifact = ArtifactPath(process, entry.record);
      if (entry.artifact.has_value()) {
        std::vector<uint8_t> data;
-@@ -2564,8 +2635,163 @@ std::optional<RunCandidate> FindConfiguredRun(const fs::path &runs) {
+@@ -2043,8 +2128,15 @@ ProcessSummary RepairProcess(const fs::path &process, const fs::path &output) {
+     if (!catalog.has_value()) {
+       continue;
+     }
++    uint64_t dex_object_id = 0u;
++    if (entry.record["dex_object_id"].isUInt64()) {
++      dex_object_id = entry.record["dex_object_id"].asUInt64();
++    } else if (entry.record["dex_object_id"].isUInt()) {
++      dex_object_id = entry.record["dex_object_id"].asUInt();
++    }
+     candidates.push_back(DexCandidate{*entry.artifact, entry.relative_artifact,
+-                                      entry.digest, std::move(*catalog)});
++                                      entry.digest, std::move(*catalog),
++                                      dex_object_id});
+     candidate_digests.insert(entry.digest);
+   }
+ 
+@@ -2187,7 +2279,8 @@ ProcessSummary RepairProcess(const fs::path &process, const fs::path &output) {
+     }
+     std::vector<std::pair<std::string, uint32_t>> matches;
+     for (const DexCandidate &candidate : candidates) {
+-      if (auto offset = MatchCodeItem(entry->record, candidate.catalog);
++      if (auto offset = MatchCodeItem(entry->record, candidate.catalog,
++                                      candidate.dex_object_id);
+           offset.has_value()) {
+         matches.emplace_back(candidate.digest, *offset);
+       }
+@@ -2564,8 +2657,163 @@ std::optional<RunCandidate> FindConfiguredRun(const fs::path &runs) {
  #endif
  }
  
@@ -286,7 +373,7 @@ index 9d6696d..b1002d8 100644
    std::error_code error;
    fs::create_directories(destination, error);
    if (error) {
-@@ -2573,14 +2799,31 @@ bool CopyTree(const fs::path &source, const fs::path &destination,
+@@ -2573,14 +2821,31 @@ bool CopyTree(const fs::path &source, const fs::path &destination,
      return false;
    }
    chmod(destination.c_str(), kDirectoryMode);
@@ -320,7 +407,7 @@ index 9d6696d..b1002d8 100644
      const fs::file_status status = entry.symlink_status(error);
      if (error || fs::is_symlink(status)) {
        *detail = "source_symlink_rejected";
-@@ -2593,6 +2836,31 @@ bool CopyTree(const fs::path &source, const fs::path &destination,
+@@ -2593,6 +2858,31 @@ bool CopyTree(const fs::path &source, const fs::path &destination,
      }
      const fs::path target = destination / relative;
      if (fs::is_directory(status)) {
@@ -352,7 +439,7 @@ index 9d6696d..b1002d8 100644
        fs::create_directory(target, error);
        if (error && error != std::errc::file_exists) {
          *detail = "create_staging_directory_failed";
-@@ -2614,14 +2882,16 @@ bool CopyTree(const fs::path &source, const fs::path &destination,
+@@ -2614,14 +2904,16 @@ bool CopyTree(const fs::path &source, const fs::path &destination,
        return false;
      }
      total_bytes += size;
@@ -372,7 +459,7 @@ index 9d6696d..b1002d8 100644
    return true;
  }
  
-@@ -2710,8 +2980,17 @@ bool AddFileToZip(ZipWriter *writer, const fs::path &file,
+@@ -2710,8 +3002,17 @@ bool AddFileToZip(ZipWriter *writer, const fs::path &file,
    return (input.eof() || input.good()) && writer->FinishEntry() == 0;
  }
  
@@ -392,7 +479,7 @@ index 9d6696d..b1002d8 100644
    FILE *file = fopen(archive.c_str(), "wb");
    if (file == nullptr) {
      return false;
-@@ -2719,19 +2998,15 @@ bool CreateZip(const fs::path &source, const fs::path &archive,
+@@ -2719,19 +3020,15 @@ bool CreateZip(const fs::path &source, const fs::path &archive,
    ZipWriter writer(file);
    bool ok = true;
    std::error_code error;
@@ -421,7 +508,7 @@ index 9d6696d..b1002d8 100644
      const std::string name =
          prefix + "/" + fs::relative(path, source, error).generic_string();
      if (error || !AddFileToZip(&writer, path, name)) {
-@@ -2755,7 +3030,7 @@ bool CreateZip(const fs::path &source, const fs::path &archive,
+@@ -2755,7 +3052,7 @@ bool CreateZip(const fs::path &source, const fs::path &archive,
  
  std::string PublicPath(const fs::path &path) {
    const std::string native = path.string();
@@ -430,7 +517,7 @@ index 9d6696d..b1002d8 100644
    if (native.rfind(root, 0u) == 0u) {
      return "/sdcard" + native.substr(root.size());
    }
-@@ -2783,12 +3058,14 @@ bool CopyApksAndManifests(const std::vector<int> &apk_fds,
+@@ -2783,12 +3080,14 @@ bool CopyApksAndManifests(const std::vector<int> &apk_fds,
        *detail = "copy_apk_failed";
        return false;
      }
@@ -447,7 +534,7 @@ index 9d6696d..b1002d8 100644
      }
    }
    Json::Value index(Json::objectValue);
-@@ -2798,20 +3075,83 @@ bool CopyApksAndManifests(const std::vector<int> &apk_fds,
+@@ -2798,20 +3097,83 @@ bool CopyApksAndManifests(const std::vector<int> &apk_fds,
    return WriteText(staging / "jadx-input.json", JsonText(index));
  }
  
@@ -536,7 +623,7 @@ index 9d6696d..b1002d8 100644
    auto candidate = FindConfiguredRun(runs);
    if (!candidate.has_value()) {
      candidate = FindLatestRun(runs);
-@@ -2823,6 +3163,9 @@ Status ExportLatest(const fs::path &storage_root,
+@@ -2823,6 +3185,9 @@ Status ExportLatest(const fs::path &storage_root,
    summary->run_id = candidate->run_id;
    summary->remote_artifact_count = candidate->artifact_count;
  
@@ -546,7 +633,7 @@ index 9d6696d..b1002d8 100644
    std::error_code error;
    const fs::path package_output =
        downloads_root / "r0dump-exports" / std::string(package_name);
-@@ -2839,14 +3182,31 @@ Status ExportLatest(const fs::path &storage_root,
+@@ -2839,14 +3204,31 @@ Status ExportLatest(const fs::path &storage_root,
        std::to_string(
            std::chrono::steady_clock::now().time_since_epoch().count());
    const fs::path staging = package_output / unique;
@@ -579,7 +666,7 @@ index 9d6696d..b1002d8 100644
  
    Json::Value process_reports(Json::arrayValue);
    std::vector<fs::path> processes;
-@@ -2859,7 +3219,16 @@ Status ExportLatest(const fs::path &storage_root,
+@@ -2859,7 +3241,16 @@ Status ExportLatest(const fs::path &storage_root,
      error.clear();
    }
    std::sort(processes.begin(), processes.end());
@@ -596,7 +683,7 @@ index 9d6696d..b1002d8 100644
      const fs::path repair = process / "host-repair";
      const ProcessSummary result = RepairProcess(process, repair);
      summary->record_count += result.record_count;
-@@ -2888,6 +3257,65 @@ Status ExportLatest(const fs::path &storage_root,
+@@ -2888,6 +3279,86 @@ Status ExportLatest(const fs::path &storage_root,
      return Status::kRepairFailed;
    }
  
@@ -611,23 +698,40 @@ index 9d6696d..b1002d8 100644
 +  std::vector<CollectedDex> collected_dex;
 +  {
 +    std::error_code dex_error;
-+    std::vector<fs::path> dex_candidates;
++    // Prefer host-repair output: those are the DEX with CodeItem fragments
++    // written back. The raw captures are only the fallback for blobs the repair
++    // pass could not touch, otherwise dex/ would hand out the unbackfilled copy.
++    std::vector<fs::path> repaired_candidates;
++    std::vector<fs::path> raw_candidates;
 +    for (const fs::directory_entry &entry :
 +         fs::recursive_directory_iterator(staging, dex_error)) {
 +      if (dex_error) {
 +        break;
 +      }
++      if (!entry.is_regular_file(dex_error)) {
++        continue;
++      }
 +      const std::string name = entry.path().filename().string();
-+      if (entry.is_regular_file(dex_error) &&
-+          name.find(".dex.raw") != std::string::npos) {
-+        dex_candidates.push_back(entry.path());
++      const std::string path_string = entry.path().generic_string();
++      const bool is_repaired =
++          path_string.find("/host-repair/repaired/") != std::string::npos &&
++          name.size() > 4u && name.compare(name.size() - 4u, 4u, ".dex") == 0;
++      if (is_repaired) {
++        repaired_candidates.push_back(entry.path());
++      } else if (name.find(".dex.raw") != std::string::npos) {
++        raw_candidates.push_back(entry.path());
 +      }
 +    }
-+    std::sort(dex_candidates.begin(), dex_candidates.end());
++    std::sort(repaired_candidates.begin(), repaired_candidates.end());
++    std::sort(raw_candidates.begin(), raw_candidates.end());
++    std::vector<fs::path> dex_candidates = repaired_candidates;
++    dex_candidates.insert(dex_candidates.end(), raw_candidates.begin(),
++                          raw_candidates.end());
 +    const fs::path dex_directory = staging / "dex";
 +    fs::create_directories(dex_directory, dex_error);
 +    dex_error.clear();
 +    chmod(dex_directory.c_str(), kDirectoryMode);
++    std::set<std::string> published_digests;
 +    for (const fs::path &candidate : dex_candidates) {
 +      std::vector<uint8_t> data;
 +      if (!ReadFile(candidate, &data) || data.size() < 112u) {
@@ -642,6 +746,10 @@ index 9d6696d..b1002d8 100644
 +          (static_cast<uint32_t>(data[34]) << 16) |
 +          (static_cast<uint32_t>(data[35]) << 24);
 +      if (declared != data.size()) {
++        continue;
++      }
++      const std::string digest = Sha256(data);
++      if (!published_digests.insert(digest).second) {
 +        continue;
 +      }
 +      const std::string stem = candidate.stem().stem().string();
@@ -662,7 +770,7 @@ index 9d6696d..b1002d8 100644
    Json::Value export_report(Json::objectValue);
    export_report["schema"] = 1;
    export_report["algorithm_version"] = kAlgorithmVersion;
-@@ -2903,46 +3331,178 @@ Status ExportLatest(const fs::path &storage_root,
+@@ -2903,46 +3374,178 @@ Status ExportLatest(const fs::path &storage_root,
      return Status::kRepairFailed;
    }
  
