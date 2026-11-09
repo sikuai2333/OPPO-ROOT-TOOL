@@ -1,0 +1,32 @@
+diff --git a/lineage_hima.mk b/lineage_hima.mk
+index ba845b0..8ff22f6 100644
+--- a/lineage_hima.mk
++++ b/lineage_hima.mk
+@@ -30,3 +30,27 @@ PRODUCT_BUILD_PROP_OVERRIDES += \
+     DeviceProduct=CPH2207 \
+     SystemDevice=OP4F0BL1 \
+     SystemName=CPH2207
++
++
++# Privacy control centre
++PRODUCT_PACKAGES += \
++    HimaPrivacy
++
++PRODUCT_COPY_FILES += \
++    packages/apps/HimaPrivacy/privapp-permissions-com.sikuai.privacy.xml:$(TARGET_COPY_OUT_SYSTEM_EXT)/etc/permissions/privapp-permissions-com.sikuai.privacy.xml
++
++# NDK-platform AIDL libraries
++# oplus vendor blobs were linked against AIDL libraries carrying the "_platform"
++# suffix. soong generates them (NEED_AIDL_NDK_PLATFORM_BACKEND) but does not
++# install them unless they are listed here, which left qcrild unable to link
++# and the device without cellular service.
++PRODUCT_PACKAGES += \
++    vendor.oplus.hardware.radio-V2-ndk_platform.vendor \
++    vendor.oplus.hardware.performance-V1-ndk_platform.vendor \
++    vendor.oplus.hardware.commondcs-V1-ndk_platform.vendor \
++    vendor.oplus.hardware.osense.client-V1-ndk_platform.vendor
++
++# Verification harness for the privacy controls. This app is deliberately
++# unprivileged so its checks hit the same gates a third-party app would.
++PRODUCT_PACKAGES += \
++    PrivacyProbe

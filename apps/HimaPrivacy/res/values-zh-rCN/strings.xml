@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">隐私中心</string>
+    <string name="section_device">设备访问</string>
+    <string name="section_apps">应用程序</string>
+
+    <string name="network_control">应用联网控制</string>
+    <string name="network_control_desc">逐项选择哪些应用可以访问网络</string>
+
+    <string name="camera_toggle">相机</string>
+    <string name="camera_toggle_desc">禁止所有应用使用相机</string>
+
+    <string name="mic_toggle">麦克风</string>
+    <string name="mic_toggle_desc">禁止所有应用使用麦克风</string>
+
+    <string name="clipboard_toggle">剪贴板访问提示</string>
+    <string name="clipboard_toggle_desc">有应用读取剪贴板时给出提示</string>
+
+    <string name="search_hint">搜索应用</string>
+    <string name="show_system_apps">显示系统应用</string>
+    <string name="no_apps">没有可显示的应用</string>
+    <string name="network_allowed">允许</string>
+    <string name="network_blocked">已阻断</string>
+    <string name="background_control">后台运行限制</string>
+    <string name="background_control_desc">阻止应用在后台运行或互相唤醒</string>
+    <string name="app_lock">应用锁</string>
+    <string name="app_lock_title">解锁应用</string>
+    <string name="app_lock_ready">应用锁已启用</string>
+    <string name="app_lock_service_off">请开启无障碍服务以启用应用锁</string>
+    <string name="app_lock_no_credential">请先设置锁屏密码、图案或 PIN</string>
+    <string name="app_lock_enable_service">打开无障碍设置</string>
+    <string name="app_lock_service_desc">为选定的应用加上锁屏密码保护</string>
+    <string name="identifier_control">设备标识</string>
+    <string name="identifier_control_desc">为选中的应用伪造 IMEI、序列号、SIM 标识和 Android ID</string>
+    <string name="identifier_change_identity">换一套标识</string>
+    <string name="identifier_change_identity_desc">为已勾选的应用立即生成一套全新的假标识</string>
+    <string name="identifier_changed">已更换新标识</string>
+    <string name="device_profile_entry">机型伪装</string>
+    <string name="device_profile_entry_desc">让所有应用看到另一台手机</string>
+    <string name="device_profile_title">机型伪装</string>
+    <string name="device_profile_desc">把整机伪装成另一款同芯片机型。选择后需要重启生效，重启后所有应用看到的机型一致。</string>
+    <string name="device_profile_current">当前报告</string>
+    <string name="device_profile_current_desc">本机当前报告为 %1$s</string>
+    <string name="device_profile_current_real">本机当前报告真实机型</string>
+    <string name="device_profile_master">启用伪装</string>
+    <string name="device_profile_master_desc">下次重启后生效</string>
+    <string name="device_profile_none">不伪装</string>
+    <string name="device_profile_none_desc">恢复汇报本机真实机型</string>
+    <string name="device_profile_reboot_needed">已选择 %1$s，下次开机后生效。现在重启？</string>
+    <string name="device_profile_reboot_off">下次开机时将关闭机型伪装。</string>
+    <string name="device_profile_pick_first">请先选择一款机型。</string>
+    <string name="device_profile_reboot_now">立即重启</string>
+    <string name="device_profile_notification">重启后生效</string>
+</resources>

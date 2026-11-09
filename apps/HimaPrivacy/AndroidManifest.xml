@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.sikuai.privacy"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="35" android:targetSdkVersion="35" />
+
+    <!-- Per-app firewall: NetworkPolicyManager.setUidInternetBlocked -->
+    <uses-permission android:name="android.permission.MANAGE_NETWORK_POLICY" />
+    <!-- Clipboard access notifications toggle -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
+    <!-- Reading current camera/microphone block state -->
+    <uses-permission android:name="android.permission.OBSERVE_SENSOR_PRIVACY" />
+    <uses-permission android:name="android.permission.MANAGE_SENSOR_PRIVACY" />
+    <!-- Listing all installed applications -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
+    <!-- Granted to this platform-signed app so its "reboot to apply the device
+         profile" notice is posted through the central notification listener. -->
+    <uses-permission android:name="com.sikuai.privacy.permission.POST_REBOOT_NOTICE" />
+
+    <application
+        android:label="@string/app_name"
+        android:icon="@android:drawable/ic_lock_lock"
+        android:theme="@android:style/Theme.DeviceDefault.DayNight"
+        android:allowBackup="false">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".AppBackgroundActivity"
+            android:exported="false"
+            android:label="@string/background_control"
+            android:parentActivityName=".MainActivity" />
+
+        <activity
+            android:name=".AppNetworkActivity"
+            android:exported="false"
+            android:label="@string/network_control"
+            android:parentActivityName=".MainActivity" />
+
+
+        <activity
+            android:name=".IdentifierActivity"
+            android:exported="false"
+            android:label="@string/identifier_control"
+            android:parentActivityName=".MainActivity" />
+
+        <activity
+            android:name=".DeviceSpoofActivity"
+            android:exported="false"
+            android:label="@string/device_profile_title"
+            android:parentActivityName=".MainActivity" />
+
+        <activity
+            android:name=".AppLockActivity"
+            android:exported="false"
+            android:label="@string/app_lock"
+            android:parentActivityName=".MainActivity" />
+
+        <activity
+            android:name=".AppLockGateActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <service
+            android:name=".AppLockService"
+            android:exported="true"
+            android:label="@string/app_lock"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/app_lock_service" />
+        </service>
+
+    </application>
+</manifest>

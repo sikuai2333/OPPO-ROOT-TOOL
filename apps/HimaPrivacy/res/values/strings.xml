@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Privacy Center</string>
+    <string name="section_device">Device access</string>
+    <string name="section_apps">Applications</string>
+
+    <string name="network_control">App network access</string>
+    <string name="network_control_desc">Choose which apps may reach the internet</string>
+
+    <string name="camera_toggle">Camera</string>
+    <string name="camera_toggle_desc">Block all apps from using the camera</string>
+
+    <string name="mic_toggle">Microphone</string>
+    <string name="mic_toggle_desc">Block all apps from using the microphone</string>
+
+    <string name="clipboard_toggle">Clipboard access alerts</string>
+    <string name="clipboard_toggle_desc">Show a notice when an app reads the clipboard</string>
+
+    <string name="search_hint">Search apps</string>
+    <string name="show_system_apps">Show system apps</string>
+    <string name="no_apps">No apps to show</string>
+    <string name="network_allowed">Allowed</string>
+    <string name="network_blocked">Blocked</string>
+    <string name="background_control">Background activity</string>
+    <string name="background_control_desc">Stop apps from running or waking each other in the background</string>
+    <string name="app_lock">App lock</string>
+    <string name="app_lock_title">Unlock app</string>
+    <string name="app_lock_ready">App lock is active</string>
+    <string name="app_lock_service_off">Turn on the accessibility service to enable app lock</string>
+    <string name="app_lock_no_credential">Set a screen PIN, pattern or password first</string>
+    <string name="app_lock_enable_service">Open accessibility settings</string>
+    <string name="app_lock_service_desc">Locks selected apps behind your screen credential</string>
+    <string name="identifier_control">Device identifiers</string>
+    <string name="identifier_control_desc">Give the selected apps a fake IMEI, serial number, SIM and device identifiers</string>
+    <string name="identifier_shuffle">Change the fake identity</string>
+    <string name="identifier_shuffle_desc">Every selected app gets a brand new set of fake identifiers</string>
+    <string name="identifier_shuffled">Fake identity changed</string>
+    <string name="identifier_off_hint">Switch on an app below first</string>
+    <string name="identifier_change_identity">Change the fake identity</string>
+    <string name="identifier_change_identity_desc">Every selected app gets a brand new set of fake identifiers</string>
+    <string name="identifier_changed">New identity applied</string>
+    <string name="device_profile_entry">Emulated device</string>
+    <string name="device_profile_entry_desc">Report a different phone to every app</string>
+    <string name="device_profile_title">Emulated device</string>
+    <string name="device_profile_desc">Make the whole system report another phone built on the same chipset. The choice applies after a reboot, and every app sees the same values.</string>
+    <string name="device_profile_current">Currently reported</string>
+    <string name="device_profile_current_desc">This device reports itself as %1$s</string>
+    <string name="device_profile_current_real">This device reports its real identity</string>
+    <string name="device_profile_master">Emulation enabled</string>
+    <string name="device_profile_master_desc">Takes effect on the next reboot</string>
+    <string name="device_profile_none">Do not spoof</string>
+    <string name="device_profile_none_desc">Report the real model of this phone</string>
+    <string name="device_profile_reboot_needed">%1$s will be applied the next time the device starts. Reboot now?</string>
+    <string name="device_profile_reboot_off">Emulation will be turned off the next time the device starts.</string>
+    <string name="device_profile_pick_first">Pick a device first.</string>
+    <string name="device_profile_reboot_now">Reboot now</string>
+    <string name="device_profile_notification">Reboot to apply the change</string>
+</resources>

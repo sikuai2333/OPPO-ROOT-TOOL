@@ -1,0 +1,13 @@
+android_app {
+    name: "PrivacyProbe",
+    manifest: "AndroidManifest.xml",
+    srcs: ["src/**/*.java"],
+    resource_dirs: ["res"],
+    platform_apis: true,
+    certificate: "platform",
+    privileged: false,
+    system_ext_specific: true,
+    optimize: {
+        enabled: false,
+    },
+}

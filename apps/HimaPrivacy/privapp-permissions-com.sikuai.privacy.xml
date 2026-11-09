@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<permissions>
+    <privapp-permissions package="com.sikuai.privacy">
+        <permission name="android.permission.MANAGE_NETWORK_POLICY"/>
+        <permission name="android.permission.WRITE_SECURE_SETTINGS"/>
+        <permission name="android.permission.OBSERVE_SENSOR_PRIVACY"/>
+        <permission name="android.permission.MANAGE_SENSOR_PRIVACY"/>
+    </privapp-permissions>
+</permissions>

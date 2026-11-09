@@ -1,0 +1,14 @@
+diff --git a/BoardConfigCommon.mk b/BoardConfigCommon.mk
+index 036d850..dea2100 100644
+--- a/BoardConfigCommon.mk
++++ b/BoardConfigCommon.mk
+@@ -198,3 +198,9 @@ WPA_SUPPLICANT_VERSION := VER_0_8_X
+ 
+ # Include the proprietary files BoardConfig.
+ include vendor/oppo/sm8250-common/BoardConfigVendor.mk
++
++# oplus/QTI 的 proprietary .so 内部 DT_NEEDED 写死了原厂构建时的 AIDL 库名，
++# 形如 vendor.oplus.hardware.*-V1-ndk_platform.so。默认情况下 soong 只为
++# aidl_interface 生成 -V1-ndk 变体，导致 check_elf_files 在链接/校验阶段报错。
++# 打开这个官方开关后 soong 会额外生成 -ndk_platform 变体，名字即可对上。
++NEED_AIDL_NDK_PLATFORM_BACKEND := true
